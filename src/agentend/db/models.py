@@ -136,6 +136,51 @@ class Memory(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
+class MCPServer(Base):
+    __tablename__ = "mcp_servers"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
+    transport: Mapped[str] = mapped_column(String(32), nullable=False)
+    command: Mapped[str | None] = mapped_column(Text, nullable=True)
+    args_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    enabled: Mapped[str] = mapped_column(String(8), default="true", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="unknown", nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class MCPTool(Base):
+    __tablename__ = "mcp_tools"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    server_id: Mapped[str] = mapped_column(ForeignKey("mcp_servers.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    local_name: Mapped[str] = mapped_column(String(512), unique=True, nullable=False, index=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    input_schema_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    enabled: Mapped[str] = mapped_column(String(8), default="true", nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class MCPToolCall(Base):
+    __tablename__ = "mcp_tool_calls"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), nullable=False, index=True)
+    step_id: Mapped[str | None] = mapped_column(ForeignKey("run_steps.id"), nullable=True, index=True)
+    server_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    tool_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    input_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    output_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    latency_ms: Mapped[int] = mapped_column(default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class EventLog(Base):
     __tablename__ = "event_log"
 

@@ -11,6 +11,7 @@ from agentend.core.llm_router import LLMRouter
 from agentend.core.profile import load_agent_profile
 from agentend.core.workflow_registry import WorkflowRegistry
 from agentend.core.workflow_runner import WorkflowRunner
+from agentend.mcp.manager import MCPManager
 from agentend.db.models import Message, Run
 from agentend.db.session import init_database, session_scope
 
@@ -23,11 +24,13 @@ runs_app = typer.Typer(help="Run inspection commands.", no_args_is_help=True)
 llm_app = typer.Typer(help="LLM configuration commands.", no_args_is_help=True)
 agent_app = typer.Typer(help="Agent profile commands.", no_args_is_help=True)
 workflows_app = typer.Typer(help="Workflow commands.", no_args_is_help=True)
+mcp_app = typer.Typer(help="MCP server commands.", no_args_is_help=True)
 app.add_typer(db_app, name="db")
 app.add_typer(runs_app, name="runs")
 app.add_typer(llm_app, name="llm")
 app.add_typer(agent_app, name="agent")
 app.add_typer(workflows_app, name="workflows")
+app.add_typer(mcp_app, name="mcp")
 
 
 @app.callback()
@@ -215,6 +218,76 @@ def workflows_run(
     result = WorkflowRunner(home or Path.cwd()).run(workflow, input_text)
     typer.echo(f"Run: {result.run_id}")
     typer.echo(result.output)
+
+
+@mcp_app.command("add")
+def mcp_add(
+    name: str,
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+    stdio: Optional[str] = typer.Option(None, "--stdio", help="stdio server command."),
+    http: Optional[str] = typer.Option(None, "--http", help="streamable HTTP MCP URL."),
+) -> None:
+    """Add or update an MCP server."""
+    manager = MCPManager(home or Path.cwd())
+    if stdio:
+        server = manager.add_stdio_server(name, stdio)
+    elif http:
+        server = manager.add_http_server(name, http)
+    else:
+        raise typer.BadParameter("Provide either --stdio or --http")
+    typer.echo(f"Added MCP server: {server.name} ({server.transport})")
+
+
+@mcp_app.command("list")
+def mcp_list(
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """List MCP servers."""
+    servers = MCPManager(home or Path.cwd()).list_servers()
+    for server in servers:
+        typer.echo(f"{server.name}  {server.transport}  {server.status}")
+
+
+@mcp_app.command("refresh")
+def mcp_refresh(
+    name: str,
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Refresh and register tools from one MCP server."""
+    names = MCPManager(home or Path.cwd()).refresh(name)
+    for local_name in names:
+        typer.echo(local_name)
+
+
+@mcp_app.command("tools")
+def mcp_tools(
+    name: str,
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """List registered tools for one MCP server."""
+    tools = MCPManager(home or Path.cwd()).list_tools(name)
+    for tool in tools:
+        typer.echo(f"{tool.local_name}  enabled={tool.enabled}")
+
+
+@mcp_app.command("test")
+def mcp_test(
+    name: str,
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Test one MCP server by refreshing its tools."""
+    count = MCPManager(home or Path.cwd()).test(name)
+    typer.echo(f"MCP server {name} ok; tools={count}")
+
+
+@mcp_app.command("remove")
+def mcp_remove(
+    name: str,
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Remove an MCP server and its registered tools."""
+    MCPManager(home or Path.cwd()).remove(name)
+    typer.echo(f"Removed MCP server: {name}")
 
 
 @runs_app.command("list")

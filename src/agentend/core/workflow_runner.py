@@ -32,7 +32,7 @@ class WorkflowRunner:
         config = load_config(self.home)
         profile = load_agent_profile(config)
         llm = LLMRouter(config)
-        tools = ToolRegistry()
+        tools = ToolRegistry(self.home)
         outputs: dict[str, str] = {}
 
         with session_scope(self.home) as session:

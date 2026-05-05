@@ -5,8 +5,12 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from sqlalchemy import select
+
 from agentend.core.events import record_event
-from agentend.db.models import Artifact, ToolCall
+from agentend.db.models import Artifact, MCPTool, ToolCall
+from agentend.db.session import session_scope
+from agentend.mcp.adapter import MCPRegisteredTool
 from agentend.tools.base import Tool, ToolContext, ToolResult
 from agentend.tools.file import ReadTextTool, WriteTextTool
 from agentend.tools.http import HttpRequestTool
@@ -15,7 +19,7 @@ from agentend.tools.python_exec import PythonExecTool
 
 
 class ToolRegistry:
-    def __init__(self) -> None:
+    def __init__(self, home: Path | None = None) -> None:
         self._tools: dict[str, Tool] = {}
         for tool in [
             ReadTextTool(),
@@ -26,6 +30,8 @@ class ToolRegistry:
             MemoryWriteTool(),
         ]:
             self.register(tool)
+        if home is not None:
+            self._register_mcp_tools(home)
 
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
@@ -81,3 +87,16 @@ class ToolRegistry:
                 metadata_json=json.dumps(result.data, ensure_ascii=False, sort_keys=True),
             )
         )
+
+    def _register_mcp_tools(self, home: Path) -> None:
+        with session_scope(home) as session:
+            rows = session.execute(select(MCPTool).where(MCPTool.enabled == "true")).scalars().all()
+            for row in rows:
+                self.register(
+                    MCPRegisteredTool(
+                        local_name=row.local_name,
+                        server_id=row.server_id,
+                        tool_name=row.name,
+                        input_schema=json.loads(row.input_schema_json),
+                    )
+                )
