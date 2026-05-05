@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 from typing import Optional
 
 import typer
@@ -15,6 +16,7 @@ from agentend.mcp.manager import MCPManager
 from agentend.telegram_bot import serve_telegram
 from agentend.db.models import Message, Run
 from agentend.db.session import init_database, session_scope
+from agentend.db.session import database_path
 
 app = typer.Typer(
     help="AgentEnd Lite local single-agent workflow runtime.",
@@ -68,6 +70,25 @@ def db_init(
     """Create or migrate the local SQLite database."""
     path = init_database(home or Path.cwd())
     typer.echo(f"Initialized database: {path}")
+
+
+@db_app.command("backup")
+def db_backup(
+    output: Path = typer.Option(..., "--output", "-o", help="Backup SQLite file path."),
+    home: Optional[Path] = typer.Option(
+        None,
+        "--home",
+        "-H",
+        help="AgentEnd home directory. Defaults to the current directory.",
+    ),
+) -> None:
+    """Copy the local SQLite database to a backup file."""
+    source = database_path(home or Path.cwd())
+    if not source.exists():
+        init_database(home or Path.cwd())
+    output.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, output)
+    typer.echo(f"Backed up database: {output}")
 
 
 @app.command()
