@@ -61,6 +61,26 @@ def init(
     typer.echo(f"Initialized AgentEnd Lite home: {result.home}")
 
 
+@app.command()
+def status(
+    home: Optional[Path] = typer.Option(
+        None,
+        "--home",
+        "-H",
+        help="AgentEnd home directory. Defaults to the current directory.",
+    ),
+) -> None:
+    """Show local AgentEnd configuration status."""
+    resolved_home = (home or Path.cwd()).expanduser().resolve()
+    config = load_config(resolved_home)
+    profile = load_agent_profile(config)
+    typer.echo(f"Home: {resolved_home}")
+    typer.echo(f"Database: {database_path(resolved_home)}")
+    typer.echo(f"LLM: {config.llm.provider}/{config.llm.model}")
+    typer.echo(f"Agent profile: {profile.path}")
+    typer.echo(f"Agent profile hash: {profile.digest}")
+
+
 @db_app.command("init")
 def db_init(
     home: Optional[Path] = typer.Option(

@@ -34,3 +34,17 @@ def test_init_creates_local_home_without_overwriting_agent_profile(tmp_path: Pat
 
     assert second.exit_code == 0
     assert profile.read_text(encoding="utf-8") == "# Custom Agent\n"
+
+
+def test_status_reports_home_database_llm_and_agent_profile(tmp_path: Path) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+
+    result = runner.invoke(app, ["status", "--home", str(home)])
+
+    assert result.exit_code == 0
+    assert str(home.resolve()) in result.output
+    assert "agentend.sqlite" in result.output
+    assert "openai" in result.output
+    assert "agent.md" in result.output
