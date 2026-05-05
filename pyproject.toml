@@ -15,6 +15,7 @@ dependencies = [
   "typer>=0.12",
   "python-telegram-bot>=21",
   "mcp>=1.0",
+  "starlette>=0.40,<0.48",
 ]
 
 [project.optional-dependencies]
