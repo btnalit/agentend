@@ -59,7 +59,7 @@ description: Minimal LLM-to-final workflow.
 nodes:
   - id: answer
     type: llm
-    prompt: "Answer the user message clearly."
+    prompt: "{input}"
   - id: final
     type: final
     depends_on: [answer]

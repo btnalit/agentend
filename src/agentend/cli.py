@@ -12,6 +12,7 @@ from agentend.core.profile import load_agent_profile
 from agentend.core.workflow_registry import WorkflowRegistry
 from agentend.core.workflow_runner import WorkflowRunner
 from agentend.mcp.manager import MCPManager
+from agentend.telegram_bot import serve_telegram
 from agentend.db.models import Message, Run
 from agentend.db.session import init_database, session_scope
 
@@ -25,12 +26,14 @@ llm_app = typer.Typer(help="LLM configuration commands.", no_args_is_help=True)
 agent_app = typer.Typer(help="Agent profile commands.", no_args_is_help=True)
 workflows_app = typer.Typer(help="Workflow commands.", no_args_is_help=True)
 mcp_app = typer.Typer(help="MCP server commands.", no_args_is_help=True)
+telegram_app = typer.Typer(help="Telegram bot commands.", no_args_is_help=True)
 app.add_typer(db_app, name="db")
 app.add_typer(runs_app, name="runs")
 app.add_typer(llm_app, name="llm")
 app.add_typer(agent_app, name="agent")
 app.add_typer(workflows_app, name="workflows")
 app.add_typer(mcp_app, name="mcp")
+app.add_typer(telegram_app, name="telegram")
 
 
 @app.callback()
@@ -288,6 +291,18 @@ def mcp_remove(
     """Remove an MCP server and its registered tools."""
     MCPManager(home or Path.cwd()).remove(name)
     typer.echo(f"Removed MCP server: {name}")
+
+
+@telegram_app.command("serve")
+def telegram_serve(
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Run the Telegram Bot with long polling."""
+    try:
+        serve_telegram(home or Path.cwd())
+    except RuntimeError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(1) from exc
 
 
 @runs_app.command("list")
