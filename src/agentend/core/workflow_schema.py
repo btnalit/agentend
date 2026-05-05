@@ -13,6 +13,7 @@ class WorkflowNode(BaseModel):
     prompt: str | None = None
     depends_on: list[str] = Field(default_factory=list)
     tool: str | None = None
+    workflow: str | None = None
     input: dict[str, Any] = Field(default_factory=dict)
 
 
