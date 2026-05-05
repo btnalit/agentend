@@ -63,6 +63,37 @@ class Run(Base):
     conversation: Mapped[Conversation] = relationship(back_populates="runs")
 
 
+class RunStep(Base):
+    __tablename__ = "run_steps"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), nullable=False, index=True)
+    node_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    input_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    output_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+        nullable=False,
+    )
+
+
+class WorkflowDef(Base):
+    __tablename__ = "workflow_defs"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    version: Mapped[str] = mapped_column(String(64), default="1", nullable=False)
+    source_path: Mapped[str] = mapped_column(Text, nullable=False)
+    source_yaml: Mapped[str] = mapped_column(Text, nullable=False)
+    enabled: Mapped[str] = mapped_column(String(8), default="true", nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class EventLog(Base):
     __tablename__ = "event_log"
 

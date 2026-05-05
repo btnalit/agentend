@@ -9,6 +9,8 @@ from agentend.core.conversation import ConversationService
 from agentend.core.init import initialize_home
 from agentend.core.llm_router import LLMRouter
 from agentend.core.profile import load_agent_profile
+from agentend.core.workflow_registry import WorkflowRegistry
+from agentend.core.workflow_runner import WorkflowRunner
 from agentend.db.models import Message, Run
 from agentend.db.session import init_database, session_scope
 
@@ -20,10 +22,12 @@ db_app = typer.Typer(help="Database commands.", no_args_is_help=True)
 runs_app = typer.Typer(help="Run inspection commands.", no_args_is_help=True)
 llm_app = typer.Typer(help="LLM configuration commands.", no_args_is_help=True)
 agent_app = typer.Typer(help="Agent profile commands.", no_args_is_help=True)
+workflows_app = typer.Typer(help="Workflow commands.", no_args_is_help=True)
 app.add_typer(db_app, name="db")
 app.add_typer(runs_app, name="runs")
 app.add_typer(llm_app, name="llm")
 app.add_typer(agent_app, name="agent")
+app.add_typer(workflows_app, name="workflows")
 
 
 @app.callback()
@@ -160,6 +164,57 @@ def agent_edit(
     profile = load_agent_profile(load_config(home or Path.cwd()))
     editor = os.environ.get("EDITOR") or ("notepad" if os.name == "nt" else "vi")
     subprocess.run([editor, str(profile.path)], check=False)
+
+
+@workflows_app.command("list")
+def workflows_list(
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """List valid workflows."""
+    registry = WorkflowRegistry(load_config(home or Path.cwd()))
+    workflows, errors = registry.list_workflows()
+    for workflow in workflows:
+        typer.echo(f"{workflow.id}  {workflow.name}")
+    for error in errors:
+        typer.echo(f"ERROR {error.path.name}: {error.message}")
+
+
+@workflows_app.command("show")
+def workflows_show(
+    workflow_id: str,
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Show one workflow definition."""
+    workflow = WorkflowRegistry(load_config(home or Path.cwd())).get(workflow_id)
+    typer.echo(workflow.model_dump_json(indent=2))
+
+
+@workflows_app.command("validate")
+def workflows_validate(
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Validate all workflow YAML files."""
+    workflows, errors = WorkflowRegistry(load_config(home or Path.cwd())).list_workflows()
+    for workflow in workflows:
+        typer.echo(f"OK {workflow.id}")
+    if errors:
+        for error in errors:
+            typer.echo(f"ERROR {error.path.name}: {error.message}")
+        raise typer.Exit(1)
+
+
+@workflows_app.command("run")
+def workflows_run(
+    workflow_id: str,
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+    input_text: str = typer.Option("", "--input", help="Workflow input text."),
+) -> None:
+    """Run a workflow by id."""
+    registry = WorkflowRegistry(load_config(home or Path.cwd()))
+    workflow = registry.get(workflow_id)
+    result = WorkflowRunner(home or Path.cwd()).run(workflow, input_text)
+    typer.echo(f"Run: {result.run_id}")
+    typer.echo(result.output)
 
 
 @runs_app.command("list")
