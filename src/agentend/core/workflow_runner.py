@@ -23,6 +23,13 @@ class WorkflowRunResult:
     output: str
 
 
+class WorkflowRunFailed(RuntimeError):
+    def __init__(self, run_id: str, message: str):
+        super().__init__(message)
+        self.run_id = run_id
+        self.message = message
+
+
 class WorkflowRunner:
     def __init__(self, home: Path):
         self.home = home.expanduser().resolve()
@@ -34,6 +41,8 @@ class WorkflowRunner:
         llm = LLMRouter(config)
         tools = ToolRegistry(self.home)
         outputs: dict[str, str] = {}
+        result: WorkflowRunResult | None = None
+        failure: WorkflowRunFailed | None = None
 
         with session_scope(self.home) as session:
             conversation = Conversation(
@@ -60,15 +69,34 @@ class WorkflowRunner:
             record_event(session, "run.created", {"workflow_id": workflow.id}, run_id=run.id)
             record_event(session, "workflow.loaded", {"workflow_id": workflow.id}, run_id=run.id)
 
-            for node in self._ordered_nodes(workflow):
-                output = self._run_node(session, run.id, node, user_input, outputs, llm, tools)
-                outputs[node.id] = output
+            try:
+                for node in self._ordered_nodes(workflow):
+                    output = self._run_node(session, run.id, node, user_input, outputs, llm, tools)
+                    outputs[node.id] = output
+                    if node.type == "human_input":
+                        run.status = "waiting_input"
+                        run.result_json = json.dumps({"prompt": output}, ensure_ascii=False)
+                        record_event(session, "run.state_changed", {"status": "waiting_input"}, run_id=run.id)
+                        result = WorkflowRunResult(run_id=run.id, output=output)
+                        break
 
-            final_output = outputs[workflow.nodes[-1].id]
-            run.status = "completed"
-            run.result_json = json.dumps({"content": final_output}, ensure_ascii=False)
-            record_event(session, "run.completed", {"workflow_id": workflow.id}, run_id=run.id)
-            return WorkflowRunResult(run_id=run.id, output=final_output)
+                if result is None:
+                    final_output = outputs[workflow.nodes[-1].id]
+                    run.status = "completed"
+                    run.result_json = json.dumps({"content": final_output}, ensure_ascii=False)
+                    record_event(session, "run.completed", {"workflow_id": workflow.id}, run_id=run.id)
+                    result = WorkflowRunResult(run_id=run.id, output=final_output)
+            except Exception as exc:
+                run.status = "failed"
+                run.error = str(exc)
+                run.result_json = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                record_event(session, "run.failed", {"error": str(exc)}, run_id=run.id)
+                failure = WorkflowRunFailed(run.id, str(exc))
+
+        if failure is not None:
+            raise failure
+        assert result is not None
+        return result
 
     def _run_node(
         self,
@@ -93,48 +121,58 @@ class WorkflowRunner:
         session.add(step)
         record_event(session, "step.started", {"node_id": persisted_node_id, "type": node.type}, run_id=run_id)
 
-        if node.type == "llm":
-            prompt = (node.prompt or "{input}").format(input=user_input, **outputs)
-            output = llm.complete(prompt)
-        elif node.type == "tool":
-            if node.tool is None:
-                raise ValueError(f"Tool node {node.id} is missing tool")
-            rendered_input = self._render_data(node.input, user_input, outputs)
-            result = tools.call(
-                node.tool,
-                rendered_input,
-                ToolContext(home=self.home, run_id=run_id, step_id=step.id, session=session),
-            )
-            output = result.content
-        elif node.type == "workflow_call":
-            if node.workflow is None:
-                raise ValueError(f"Workflow call node {node.id} is missing workflow")
-            child = WorkflowRegistry(load_config(self.home)).get(node.workflow)
-            output = self._run_inline_workflow(
-                session=session,
-                run_id=run_id,
-                workflow=child,
-                user_input=user_input,
-                llm=llm,
-                tools=tools,
-                prefix=f"{node.id}.",
-            )
-        elif node.type == "condition":
-            rendered_input = self._render_data(node.input, user_input, outputs)
-            output = "true" if rendered_input.get("left") == rendered_input.get("equals") else "false"
-        elif node.type == "parallel":
-            output = json.dumps({dep: outputs.get(dep, "") for dep in node.depends_on}, ensure_ascii=False)
-        elif node.type == "human_input":
-            output = str(node.input.get("prompt", "Input required"))
-        elif node.type == "final":
-            output = outputs[node.depends_on[-1]] if node.depends_on else user_input
-        else:
-            raise ValueError(f"Unsupported node type for this runner slice: {node.type}")
+        try:
+            if node.type == "llm":
+                prompt = (node.prompt or "{input}").format(input=user_input, **outputs)
+                output = llm.complete(prompt)
+            elif node.type == "tool":
+                if node.tool is None:
+                    raise ValueError(f"Tool node {node.id} is missing tool")
+                rendered_input = self._render_data(node.input, user_input, outputs)
+                result = tools.call(
+                    node.tool,
+                    rendered_input,
+                    ToolContext(home=self.home, run_id=run_id, step_id=step.id, session=session),
+                )
+                output = result.content
+            elif node.type == "workflow_call":
+                if node.workflow is None:
+                    raise ValueError(f"Workflow call node {node.id} is missing workflow")
+                child = WorkflowRegistry(load_config(self.home)).get(node.workflow)
+                output = self._run_inline_workflow(
+                    session=session,
+                    run_id=run_id,
+                    workflow=child,
+                    user_input=user_input,
+                    llm=llm,
+                    tools=tools,
+                    prefix=f"{node.id}.",
+                )
+            elif node.type == "condition":
+                rendered_input = self._render_data(node.input, user_input, outputs)
+                output = "true" if rendered_input.get("left") == rendered_input.get("equals") else "false"
+            elif node.type == "parallel":
+                output = json.dumps({dep: outputs.get(dep, "") for dep in node.depends_on}, ensure_ascii=False)
+            elif node.type == "human_input":
+                output = str(node.input.get("prompt", "Input required"))
+                step.status = "waiting_input"
+                step.output_json = json.dumps({"prompt": output}, ensure_ascii=False)
+                record_event(session, "step.completed", {"node_id": persisted_node_id}, run_id=run_id)
+                return output
+            elif node.type == "final":
+                output = outputs[node.depends_on[-1]] if node.depends_on else user_input
+            else:
+                raise ValueError(f"Unsupported node type for this runner slice: {node.type}")
 
-        step.status = "completed"
-        step.output_json = json.dumps({"content": output}, ensure_ascii=False)
-        record_event(session, "step.completed", {"node_id": persisted_node_id}, run_id=run_id)
-        return output
+            step.status = "completed"
+            step.output_json = json.dumps({"content": output}, ensure_ascii=False)
+            record_event(session, "step.completed", {"node_id": persisted_node_id}, run_id=run_id)
+            return output
+        except Exception as exc:
+            step.status = "failed"
+            step.error = str(exc)
+            record_event(session, "step.failed", {"node_id": persisted_node_id, "error": str(exc)}, run_id=run_id)
+            raise
 
     def _run_inline_workflow(
         self,

@@ -11,10 +11,11 @@ from agentend.core.init import initialize_home
 from agentend.core.llm_router import LLMRouter
 from agentend.core.profile import load_agent_profile
 from agentend.core.workflow_registry import WorkflowRegistry
-from agentend.core.workflow_runner import WorkflowRunner
+from agentend.core.workflow_runner import WorkflowRunFailed, WorkflowRunner
+from agentend.core.events import record_event
 from agentend.mcp.manager import MCPManager
 from agentend.telegram_bot import serve_telegram
-from agentend.db.models import Message, Run
+from agentend.db.models import EventLog, Message, Run
 from agentend.db.session import init_database, session_scope
 from agentend.db.session import database_path
 
@@ -29,6 +30,7 @@ agent_app = typer.Typer(help="Agent profile commands.", no_args_is_help=True)
 workflows_app = typer.Typer(help="Workflow commands.", no_args_is_help=True)
 mcp_app = typer.Typer(help="MCP server commands.", no_args_is_help=True)
 telegram_app = typer.Typer(help="Telegram bot commands.", no_args_is_help=True)
+logs_app = typer.Typer(help="Log inspection commands.", no_args_is_help=True)
 app.add_typer(db_app, name="db")
 app.add_typer(runs_app, name="runs")
 app.add_typer(llm_app, name="llm")
@@ -36,6 +38,7 @@ app.add_typer(agent_app, name="agent")
 app.add_typer(workflows_app, name="workflows")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(telegram_app, name="telegram")
+app.add_typer(logs_app, name="logs")
 
 
 @app.callback()
@@ -239,9 +242,14 @@ def workflows_run(
     """Run a workflow by id."""
     registry = WorkflowRegistry(load_config(home or Path.cwd()))
     workflow = registry.get(workflow_id)
-    result = WorkflowRunner(home or Path.cwd()).run(workflow, input_text)
-    typer.echo(f"Run: {result.run_id}")
-    typer.echo(result.output)
+    try:
+        result = WorkflowRunner(home or Path.cwd()).run(workflow, input_text)
+        typer.echo(f"Run: {result.run_id}")
+        typer.echo(result.output)
+    except WorkflowRunFailed as exc:
+        typer.echo(f"Run: {exc.run_id}")
+        typer.echo(f"Error: {exc.message}")
+        raise typer.Exit(1) from exc
 
 
 @mcp_app.command("add")
@@ -363,11 +371,70 @@ def runs_show(
         typer.echo(f"Run: {run.id}")
         typer.echo(f"Status: {run.status}")
         typer.echo(f"Workflow: {run.workflow_id or '-'}")
+        if run.error:
+            typer.echo(f"Error: {run.error}")
+        typer.echo(f"Result: {run.result_json}")
         messages = session.execute(
             select(Message).where(Message.conversation_id == run.conversation_id).order_by(Message.created_at)
         ).scalars()
         for message_row in messages:
             typer.echo(f"{message_row.role}: {message_row.content}")
+
+
+@runs_app.command("resume")
+def runs_resume(
+    run_id: str,
+    message: str = typer.Option(..., "--message", "-m", help="Message to resume a waiting run."),
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Resume a run waiting for user input."""
+    import json
+
+    with session_scope(home or Path.cwd()) as session:
+        run = session.get(Run, run_id)
+        if run is None:
+            raise typer.BadParameter(f"Unknown run: {run_id}")
+        if run.status != "waiting_input":
+            raise typer.BadParameter(f"Run is not waiting for input: {run.status}")
+        run.status = "completed"
+        run.result_json = json.dumps({"content": message}, ensure_ascii=False)
+        record_event(session, "run.state_changed", {"status": "completed"}, run_id=run.id)
+        record_event(session, "run.completed", {"resumed": True}, run_id=run.id)
+        typer.echo(f"Run: {run.id}")
+        typer.echo("Status: completed")
+        typer.echo(message)
+
+
+@runs_app.command("cancel")
+def runs_cancel(
+    run_id: str,
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Cancel a run."""
+    with session_scope(home or Path.cwd()) as session:
+        run = session.get(Run, run_id)
+        if run is None:
+            raise typer.BadParameter(f"Unknown run: {run_id}")
+        run.status = "cancelled"
+        record_event(session, "run.cancelled", {}, run_id=run.id)
+        typer.echo(f"Run: {run.id}")
+        typer.echo("Status: cancelled")
+
+
+@logs_app.command("tail")
+def logs_tail(
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+    limit: int = typer.Option(20, "--limit", "-n", help="Number of events to show."),
+) -> None:
+    """Show recent event log rows."""
+    with session_scope(home or Path.cwd()) as session:
+        rows = (
+            session.execute(select(EventLog).order_by(EventLog.created_at.desc()).limit(limit))
+            .scalars()
+            .all()
+        )
+        for row in reversed(rows):
+            typer.echo(f"{row.created_at.isoformat()}  {row.event_type}  run={row.run_id or '-'}")
 
 
 def main() -> None:

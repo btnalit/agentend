@@ -304,3 +304,25 @@ pytest
 - Linux systemd 部署文档和 service 文件可用。
 - 自动化测试覆盖核心路径。
 
+## 6. 实施状态回填
+
+更新时间：2026-05-05
+
+| 任务 | 状态 | 证据 |
+| --- | --- | --- |
+| T1 初始化骨架 | Done | `agentend --help`、`agentend init`、`pytest` 通过；提交 `feat: scaffold agentend cli initialization`。 |
+| T2 CLI + SQLite 基础会话 | Done | `chat --message` 可创建 conversation/message/run，`runs list/show` 可查询；提交 `feat: persist cli conversations in sqlite`。 |
+| T3 LLM 配置与本地 agent.md | Done | `llm set/current/test`、`agent show/reload` 可用；run 记录 profile hash 和模型配置；提交 `feat: add llm config and agent profile tracking`。 |
+| T4 Workflow Runner 垂直闭环 | Done | YAML workflow 可校验和运行，`llm -> final` 写入 `run_steps`；提交 `feat: run yaml llm workflows`。 |
+| T5 Tool Registry 和内置工具 | Done | `file.write_text` 可生成 artifact，tool call 落库，`workflow_call` 可调用子 workflow；提交 `feat: add builtin tools to workflows`。 |
+| T6 MCP 单向接入 | Done | `mcp add/refresh/tools/test/remove` 可用，MCP tool 注册为 `mcp.<server>.<tool>` 并可被 workflow 调用；提交 `feat: register mcp tools for workflows`。 |
+| T7 Telegram 会话入口 | Done | Telegram router 支持 `/start`、普通消息、`/workflows`、`/run`；`telegram serve` 缺 token 明确失败；提交 `feat: add telegram conversation entrypoint`。 |
+| T8 Linux 初始化与部署 | Done | `deploy/agentend.service`、`scripts/install-linux.sh`、README 部署说明和 `db backup` 已实现；提交 `feat: add linux deployment support`。 |
+| T9 审计、恢复和验收补齐 | Done | `runs resume/cancel`、failed run 错误摘要、`logs tail` 已实现；最终验证 `pytest -q` 通过。 |
+
+最终验证命令：
+
+```bash
+python -m pytest -q
+```
+

@@ -299,3 +299,48 @@ SQLite 并发写入能力有限。
 
 这些内容应在实施阶段按 `taskboard.md` 逐个垂直切片推进。
 
+## 9. 实施审计回填
+
+更新时间：2026-05-05
+
+### 9.1 已实现范围
+
+- Python package 和 Typer CLI。
+- SQLite 初始化、会话、消息、run、run step、tool call、MCP tool call、artifact、memory、event log。
+- 本地 `agent.md` 读取和 profile hash 记录。
+- LLM provider/model 配置、当前配置查看和缺密钥检测。
+- YAML workflow 校验和运行。
+- 内置 Tool Registry：`file.read_text`、`file.write_text`、`http.request`、`python.exec`、`memory.search`、`memory.write`。
+- MCP client 管理：add/list/refresh/tools/test/remove。
+- 已刷新 MCP tool 自动注册为 `mcp.<server>.<tool>`。
+- Telegram router 和 long polling serve 入口。
+- Linux systemd service、安装脚本、README 部署说明。
+- run resume/cancel、失败摘要、logs tail。
+
+### 9.2 裁剪和剩余风险
+
+- `python.exec` 已实现受限 builtins，但仍不等同于强沙箱；生产默认策略建议在后续版本增加显式启用开关和超时隔离。
+- MCP 真实 stdio/http 调用依赖 `mcp` Python SDK；自动化测试使用 `mock:echo` server 覆盖注册和调用链。真实第三方 MCP server 仍需在目标 Linux 环境做联调。
+- `runs resume` 首版将 waiting run 以用户补充消息完成，不会继续执行 human_input 后续节点；若需要完整断点续跑，后续应持久化 workflow cursor。
+- Telegram 首版使用 long polling，不包含 webhook 部署。
+
+### 9.3 验证记录
+
+已执行：
+
+```bash
+python -m pytest -q
+```
+
+验证覆盖：
+
+- 初始化幂等。
+- CLI 会话和 SQLite 持久化。
+- LLM 配置和 agent profile hash。
+- Workflow schema、执行和 run step。
+- 内置工具、artifact 和 workflow_call。
+- MCP tool 自动注册和 workflow 调用。
+- Telegram message router 和 token 缺失错误。
+- Linux 部署产物和 SQLite 备份。
+- waiting_input、resume、cancel、failed run 和 event log。
+
