@@ -5,7 +5,9 @@ from uuid import uuid4
 
 from sqlalchemy import select
 
+from agentend.config import load_config
 from agentend.core.events import record_event
+from agentend.core.profile import load_agent_profile
 from agentend.db.models import Conversation, Message, Run
 from agentend.db.session import init_database, session_scope
 
@@ -23,6 +25,8 @@ class ConversationService:
         init_database(self.home)
 
     def handle_message(self, channel: str, external_user_id: str, text: str) -> ConversationResponse:
+        config = load_config(self.home)
+        profile = load_agent_profile(config)
         with session_scope(self.home) as session:
             conversation = session.execute(
                 select(Conversation).where(
@@ -60,6 +64,10 @@ class ConversationService:
                 status="completed",
                 input_json=json.dumps({"message": text}, ensure_ascii=False),
                 result_json=json.dumps({"content": f"Echo: {text}"}, ensure_ascii=False),
+                agent_profile_path=str(profile.path),
+                agent_profile_hash=profile.digest,
+                llm_provider=config.llm.provider,
+                llm_model=config.llm.model,
             )
             session.add(run)
             record_event(session, "run.created", {"conversation_id": conversation.id}, run_id=run.id)

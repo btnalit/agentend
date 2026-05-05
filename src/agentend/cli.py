@@ -4,8 +4,11 @@ from typing import Optional
 import typer
 from sqlalchemy import select
 
+from agentend.config import load_config, set_llm_config
 from agentend.core.conversation import ConversationService
 from agentend.core.init import initialize_home
+from agentend.core.llm_router import LLMRouter
+from agentend.core.profile import load_agent_profile
 from agentend.db.models import Message, Run
 from agentend.db.session import init_database, session_scope
 
@@ -15,8 +18,12 @@ app = typer.Typer(
 )
 db_app = typer.Typer(help="Database commands.", no_args_is_help=True)
 runs_app = typer.Typer(help="Run inspection commands.", no_args_is_help=True)
+llm_app = typer.Typer(help="LLM configuration commands.", no_args_is_help=True)
+agent_app = typer.Typer(help="Agent profile commands.", no_args_is_help=True)
 app.add_typer(db_app, name="db")
 app.add_typer(runs_app, name="runs")
+app.add_typer(llm_app, name="llm")
+app.add_typer(agent_app, name="agent")
 
 
 @app.callback()
@@ -79,6 +86,80 @@ def chat(
         response = service.handle_message("cli", "local", text)
         typer.echo(f"Run: {response.run_id}")
         typer.echo(response.content)
+
+
+@llm_app.command("list")
+def llm_list(
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """List configured LLM providers."""
+    config = load_config(home or Path.cwd())
+    typer.echo(f"* {config.llm.provider}  model={config.llm.model}")
+
+
+@llm_app.command("set")
+def llm_set(
+    provider: str = typer.Option(..., "--provider", help="Provider name."),
+    model: str = typer.Option(..., "--model", help="Model name."),
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Set the active LLM provider and model."""
+    config = set_llm_config(home or Path.cwd(), provider=provider, model=model)
+    typer.echo(f"LLM set: {config.llm.provider}/{config.llm.model}")
+
+
+@llm_app.command("current")
+def llm_current(
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Show the active LLM provider and model."""
+    config = load_config(home or Path.cwd())
+    typer.echo(f"Provider: {config.llm.provider}")
+    typer.echo(f"Model: {config.llm.model}")
+    typer.echo(f"API key env: {config.llm.provider_config.api_key_env}")
+
+
+@llm_app.command("test")
+def llm_test(
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Validate the active LLM configuration."""
+    result = LLMRouter(load_config(home or Path.cwd())).test()
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(1)
+
+
+@agent_app.command("show")
+def agent_show(
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Print the current local agent profile."""
+    profile = load_agent_profile(load_config(home or Path.cwd()))
+    typer.echo(profile.content)
+
+
+@agent_app.command("reload")
+def agent_reload(
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Reload and print the current agent profile hash."""
+    profile = load_agent_profile(load_config(home or Path.cwd()))
+    typer.echo(f"Agent profile: {profile.path}")
+    typer.echo(f"Hash: {profile.digest}")
+
+
+@agent_app.command("edit")
+def agent_edit(
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Open the agent profile in the configured editor."""
+    import os
+    import subprocess
+
+    profile = load_agent_profile(load_config(home or Path.cwd()))
+    editor = os.environ.get("EDITOR") or ("notepad" if os.name == "nt" else "vi")
+    subprocess.run([editor, str(profile.path)], check=False)
 
 
 @runs_app.command("list")
