@@ -3,10 +3,14 @@ from pathlib import Path
 
 
 DEFAULT_CONFIG = """[llm]
-provider = "openai"
-model = "gpt-4.1"
+provider = "fake"
+model = "fake-llm"
 temperature = 0.2
 max_tokens = 4096
+
+[llm.providers.fake]
+api_key_env = ""
+base_url = ""
 
 [llm.providers.openai]
 api_key_env = "OPENAI_API_KEY"

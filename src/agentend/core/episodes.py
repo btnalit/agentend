@@ -134,14 +134,7 @@ def promote_episode_to_skill(home: Path, session: Session, episode_id: str, skil
         "id": f"skill.{skill_id}",
         "name": skill_id,
         "description": f"Draft workflow generated from episode {episode_id}.",
-        "nodes": [
-            {
-                "id": "answer",
-                "type": "llm",
-                "prompt": "Reuse the promoted episode pattern for this task: {input}",
-            },
-            {"id": "final", "type": "final", "depends_on": ["answer"]},
-        ],
+        "nodes": _draft_workflow_nodes(required_tools),
     }
     metadata = {
         "source_episode_id": episode_id,
@@ -254,3 +247,55 @@ Draft skill generated from episode `{episode.id}`.
 - This draft is not enabled automatically.
 - Review `skill.yaml`, `workflow.yaml`, examples, and evals before installing.
 """
+
+
+def _draft_workflow_nodes(required_tools: list[str]) -> list[dict]:
+    nodes: list[dict] = []
+    previous_ids: list[str] = []
+    for index, tool_name in enumerate(required_tools):
+        node_id = f"tool_{index + 1}"
+        node = {
+            "id": node_id,
+            "type": "tool",
+            "tool": tool_name,
+            "input": _draft_tool_input(tool_name),
+        }
+        if previous_ids:
+            node["depends_on"] = previous_ids[-1:]
+        nodes.append(node)
+        previous_ids.append(node_id)
+
+    answer = {
+        "id": "answer",
+        "type": "llm",
+        "prompt": "Reuse the promoted episode pattern for this task: {input}",
+    }
+    if previous_ids:
+        answer["depends_on"] = previous_ids[-1:]
+    nodes.append(answer)
+    nodes.append({"id": "final", "type": "final", "depends_on": ["answer"]})
+    return nodes
+
+
+def _draft_tool_input(tool_name: str) -> dict:
+    if tool_name in {"fs.write_text", "file.write_text"}:
+        return {"path": "promoted-output.txt", "content": "Promoted skill input: {input}"}
+    if tool_name == "fs.list":
+        return {"path": "."}
+    if tool_name == "fs.glob":
+        return {"pattern": "*"}
+    if tool_name in {"fs.read_text", "file.read_text"}:
+        return {"path": "agent.md"}
+    if tool_name == "shell.run":
+        return {"command": "echo {input}"}
+    if tool_name == "git.status":
+        return {"cwd": "."}
+    if tool_name == "web.search":
+        return {"query": "{input}", "provider": "fake", "limit": 1}
+    if tool_name == "web.fetch":
+        return {"url": "https://example.com/search/1"}
+    if tool_name == "python.exec":
+        return {"code": "print('promoted skill')"}
+    if tool_name == "tools.discover":
+        return {"query": "{input}"}
+    return {}

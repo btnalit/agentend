@@ -6,7 +6,7 @@ from sqlalchemy import select
 from typer.testing import CliRunner
 
 from agentend.cli import app
-from agentend.db.models import Run, ToolCall, ToolContractSnapshot
+from agentend.db.models import ActionPolicyDecision, Run, ToolContractSnapshot
 from agentend.db.session import session_scope
 
 
@@ -16,7 +16,7 @@ def _run_id(output: str) -> str:
     return match.group(1)
 
 
-def test_replay_dry_run_plans_reuse_and_actual_replay_reuses_tool_output(tmp_path: Path) -> None:
+def test_replay_dry_run_and_actual_replay_block_local_write(tmp_path: Path) -> None:
     home = tmp_path / "agentend-home"
     runner = CliRunner()
     assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
@@ -46,22 +46,25 @@ nodes:
     assert plan["dry_run"] is True
     assert plan["source_run_id"] == source_run_id
     save_step = next(step for step in plan["steps"] if step["node_id"] == "save")
-    assert save_step["strategy"] == "reuse_output"
+    assert plan["status"] == "blocked"
+    assert save_step["strategy"] == "block"
     assert save_step["tool_name"] == "fs.write_text"
+    assert save_step["side_effect"] == "local_write"
 
     replayed = runner.invoke(app, ["runs", "replay", source_run_id, "--home", str(home)])
-    replay_run_id = _run_id(replayed.output)
 
-    assert replayed.exit_code == 0
-    assert replay_run_id != source_run_id
-    assert "first:value" in replayed.output
+    assert replayed.exit_code == 1
+    assert "local_write is blocked during replay" in replayed.output
     with session_scope(home) as session:
-        replay_run = session.get(Run, replay_run_id)
-        replay_tool = session.execute(select(ToolCall).where(ToolCall.run_id == replay_run_id)).scalar_one()
-        assert replay_run.status == "completed"
-        assert replay_tool.tool_name == "fs.write_text"
-        assert replay_tool.status == "reused"
-        assert json.loads(replay_tool.output_json)["content"] == "first:value"
+        replay_run = session.execute(select(Run).where(Run.workflow_id == "replay_reuse").where(Run.id != source_run_id)).scalar_one()
+        decision = session.execute(
+            select(ActionPolicyDecision)
+            .where(ActionPolicyDecision.run_id == replay_run.id)
+            .where(ActionPolicyDecision.tool_name == "fs.write_text")
+        ).scalar_one()
+        assert replay_run.status == "failed"
+        assert decision.decision == "block"
+        assert decision.side_effect == "local_write"
 
 
 def test_replay_dry_run_reports_contract_drift_and_actual_replay_blocks(tmp_path: Path) -> None:

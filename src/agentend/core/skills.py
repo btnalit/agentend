@@ -12,7 +12,7 @@ import yaml
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from agentend.core.workflow_schema import load_workflow_yaml
+from agentend.core.workflow_schema import WorkflowDefinition, load_workflow_yaml
 from agentend.db.models import ExtensionRecord, ExtensionVersion, Skill, SkillMarket, utc_now
 
 
@@ -82,20 +82,9 @@ def ensure_builtin_skills(home: Path, session: Session) -> list[Skill]:
         skill_dir.mkdir(parents=True, exist_ok=True)
         workflow = skill_dir / "workflow.yaml"
         manifest = skill_dir / "skill.yaml"
-        if not workflow.exists():
-            workflow.write_text(
-                f"""id: skill.{skill_id}
-name: {skill_id}
-nodes:
-  - id: answer
-    type: llm
-    prompt: "{spec['prompt']}"
-  - id: final
-    type: final
-    depends_on: [answer]
-""",
-                encoding="utf-8",
-            )
+        workflow_yaml = _builtin_workflow_yaml(skill_id, spec)
+        if not workflow.exists() or _workflow_requires_update(workflow, spec["required_tools"]):
+            workflow.write_text(workflow_yaml, encoding="utf-8")
         if not manifest.exists():
             payload = {
                 "id": skill_id,
@@ -128,7 +117,8 @@ def load_skill_bundle(skill_dir: Path) -> SkillBundle:
     workflow_path = skill_dir / str(manifest["workflow"])
     if not workflow_path.exists():
         raise ValueError(f"Missing workflow: {workflow_path}")
-    load_workflow_yaml(workflow_path.read_text(encoding="utf-8"))
+    workflow = load_workflow_yaml(workflow_path.read_text(encoding="utf-8"))
+    _validate_required_tools(workflow, [str(item) for item in manifest.get("required_tools", [])], workflow_path)
     source = manifest.get("source") or {}
     return SkillBundle(
         id=str(manifest["id"]),
@@ -405,3 +395,100 @@ def _directory_content_hash(path: Path) -> str:
 
 def _safe_name(value: str) -> str:
     return "".join(char if char.isalnum() or char in "._-" else "_" for char in value).strip("._") or "item"
+
+
+def _builtin_workflow_yaml(skill_id: str, spec: dict) -> str:
+    workflow_id = f"skill.{skill_id}"
+    if skill_id == "file.workspace_ops":
+        nodes = [
+            {"id": "list_workspace", "type": "tool", "tool": "fs.list", "input": {"path": "."}},
+            {"id": "glob_workspace", "type": "tool", "tool": "fs.glob", "input": {"pattern": "*"}, "depends_on": ["list_workspace"]},
+            {"id": "summary", "type": "parallel", "depends_on": ["list_workspace", "glob_workspace"]},
+            {
+                "id": "answer",
+                "type": "llm",
+                "prompt": "Workspace task: {input}\n\nTool summary:\n{summary}",
+                "depends_on": ["summary"],
+            },
+            {"id": "final", "type": "final", "depends_on": ["answer"]},
+        ]
+    elif skill_id == "shell.automation":
+        nodes = [
+            {"id": "run_shell", "type": "tool", "tool": "shell.run", "input": {"command": "echo {input}"}},
+            {"id": "final", "type": "final", "depends_on": ["run_shell"]},
+        ]
+    elif skill_id == "code.local_task":
+        nodes = [
+            {"id": "git_status", "type": "tool", "tool": "git.status", "input": {"cwd": "."}},
+            {"id": "read_profile", "type": "tool", "tool": "fs.read_text", "input": {"path": "agent.md"}},
+            {"id": "python_version", "type": "tool", "tool": "shell.run", "input": {"command": "python --version"}},
+            {"id": "summary", "type": "parallel", "depends_on": ["git_status", "read_profile", "python_version"]},
+            {"id": "final", "type": "final", "depends_on": ["summary"]},
+        ]
+    elif skill_id == "data.quick_analysis":
+        nodes = [
+            {
+                "id": "analyze",
+                "type": "tool",
+                "tool": "python.exec",
+                "input": {
+                    "code": (
+                        "import json\n"
+                        "payload = {{\"input\": '''{input}'''}}\n"
+                        "print(json.dumps({{\"received\": payload[\"input\"]}}))\n"
+                    )
+                },
+            },
+            {"id": "final", "type": "final", "depends_on": ["analyze"]},
+        ]
+    elif skill_id == "research.report":
+        nodes = [
+            {"id": "search", "type": "tool", "tool": "web.search", "input": {"query": "{input}", "provider": "fake", "limit": 1}},
+            {"id": "fetch", "type": "tool", "tool": "web.fetch", "input": {"url": "https://example.com/search/1"}, "depends_on": ["search"]},
+            {
+                "id": "write_report",
+                "type": "tool",
+                "tool": "fs.write_text",
+                "input": {
+                    "path": "reports/research-report.md",
+                    "content": "# Research Report\n\nInput:\n{input}\n\nSearch evidence:\n{search}\n\nFetched source:\n{fetch}\n",
+                },
+                "depends_on": ["fetch"],
+            },
+            {"id": "final", "type": "final", "depends_on": ["write_report"]},
+        ]
+    elif skill_id == "mcp.tool_setup":
+        nodes = [
+            {"id": "discover", "type": "tool", "tool": "tools.discover", "input": {"query": "mcp"}},
+            {"id": "final", "type": "final", "depends_on": ["discover"]},
+        ]
+    else:
+        nodes = [
+            {"id": "answer", "type": "llm", "prompt": str(spec["prompt"])},
+            {"id": "final", "type": "final", "depends_on": ["answer"]},
+        ]
+    return yaml.safe_dump(
+        {"id": workflow_id, "name": skill_id, "nodes": nodes},
+        allow_unicode=True,
+        sort_keys=False,
+    )
+
+
+def _workflow_requires_update(workflow_path: Path, required_tools: list[str]) -> bool:
+    try:
+        workflow = load_workflow_yaml(workflow_path.read_text(encoding="utf-8"))
+    except Exception:
+        return True
+    used_tools = _workflow_tool_names(workflow)
+    return any(tool not in used_tools for tool in required_tools)
+
+
+def _validate_required_tools(workflow: WorkflowDefinition, required_tools: list[str], workflow_path: Path) -> None:
+    used_tools = _workflow_tool_names(workflow)
+    missing = [tool for tool in required_tools if tool not in used_tools]
+    if missing:
+        raise ValueError(f"{workflow_path}: required_tools not used by workflow: {missing}")
+
+
+def _workflow_tool_names(workflow: WorkflowDefinition) -> set[str]:
+    return {str(node.tool) for node in workflow.nodes if node.type == "tool" and node.tool}

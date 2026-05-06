@@ -85,6 +85,60 @@ def test_skills_smoke_eval_runs_builtin_skills(tmp_path: Path) -> None:
         assert all(assertion["status"] == "passed" for assertion in case["assertions"])
 
 
+def test_runtime_hardening_eval_covers_repaired_runtime_paths(tmp_path: Path) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+
+    listed = runner.invoke(app, ["eval", "list"])
+    result = runner.invoke(app, ["eval", "run", "runtime-hardening", "--home", str(home)])
+
+    assert listed.exit_code == 0
+    assert "runtime-hardening" in listed.output
+    assert result.exit_code == 0, result.output
+    payload = _report(runner, home, _eval_id(result.output))
+    cases = {case["id"]: case for case in payload["cases"]}
+
+    assert payload["suite"] == "runtime-hardening"
+    assert payload["status"] == "passed"
+    assert {
+        "llm-openai-compatible",
+        "telegram-mcp-async",
+        "http-side-effect-policy",
+        "path-boundary",
+        "skill-tool-usage",
+        "model-route-cost",
+        "evidence-export",
+    } <= set(cases)
+    assert Path(cases["evidence-export"]["export_path"]).exists()
+    for case in cases.values():
+        assert case["status"] == "passed"
+        assert case["assertions"]
+        assert all(assertion["status"] == "passed" for assertion in case["assertions"])
+
+
+def test_runtime_hardening_eval_exports_failed_case_run(tmp_path: Path) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+    disabled = runner.invoke(app, ["tools", "disable", "http.request", "--home", str(home)])
+    assert disabled.exit_code == 0, disabled.output
+
+    result = runner.invoke(app, ["eval", "run", "runtime-hardening", "--home", str(home)])
+
+    assert result.exit_code == 0, result.output
+    payload = _report(runner, home, _eval_id(result.output))
+    cases = {case["id"]: case for case in payload["cases"]}
+    http_case = cases["http-side-effect-policy"]
+    export_path = Path(http_case["export_path"])
+
+    assert payload["status"] == "failed"
+    assert http_case["status"] == "failed"
+    assert export_path.exists()
+    assert (export_path / "run.json").exists()
+    assert any(assertion["name"] == "failed eval run is exported" for assertion in http_case["assertions"])
+
+
 def test_failed_tools_smoke_eval_exports_failed_run(tmp_path: Path) -> None:
     home = tmp_path / "agentend-home"
     runner = CliRunner()

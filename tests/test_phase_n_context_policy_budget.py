@@ -6,7 +6,7 @@ from sqlalchemy import select
 from typer.testing import CliRunner
 
 from agentend.cli import app
-from agentend.db.models import ContextDroppedItem, ContextLedger, ContextPackItem, ErrorRecord, Run
+from agentend.db.models import ContextDroppedItem, ContextLedger, ContextPackItem, CostUsage, ErrorRecord, Run
 from agentend.db.session import session_scope
 
 
@@ -250,6 +250,51 @@ nodes:
         assert any("max_llm_calls" in error.message for error in errors)
         assert any("max_input_tokens" in error.message for error in errors)
         assert any("max_output_tokens" in error.message for error in errors)
+
+
+def test_workflow_llm_step_uses_model_route_and_records_cost_usage(tmp_path: Path) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+    assert runner.invoke(app, ["llm", "set", "--home", str(home), "--provider", "fake", "--model", "default-model"]).exit_code == 0
+    route = runner.invoke(
+        app,
+        [
+            "models",
+            "routes",
+            "set",
+            "workflow_step",
+            "--home",
+            str(home),
+            "--provider",
+            "fake",
+            "--model",
+            "route-model",
+        ],
+    )
+
+    result = runner.invoke(app, ["workflows", "run", "simple_chat", "--home", str(home), "--input", "route check"])
+
+    assert route.exit_code == 0, route.output
+    assert result.exit_code == 0, result.output
+    with session_scope(home) as session:
+        ledger = session.execute(select(ContextLedger)).scalar_one()
+        usage = session.execute(select(CostUsage)).scalar_one()
+        assert ledger.model_provider == "fake"
+        assert ledger.model_model == "route-model"
+        assert usage.provider == "fake"
+        assert usage.model == "route-model"
+        assert usage.model_stage == "workflow_step"
+        assert usage.input_tokens > 0
+        assert usage.output_tokens > 0
+        assert usage.total_tokens == usage.input_tokens + usage.output_tokens
+        assert usage.usage_source == "estimated"
+
+    budget = runner.invoke(app, ["budget", "set", "--home", str(home), "--workflow", "simple_chat", "--max-llm-calls", "3"])
+    shown = runner.invoke(app, ["budget", "show", "--home", str(home), "--workflow", "simple_chat"])
+    assert budget.exit_code == 0, budget.output
+    assert shown.exit_code == 0, shown.output
+    assert "usage_calls=1" in shown.output
 
 
 def test_context_long_eval_covers_policy_budget_and_source_paths(tmp_path: Path) -> None:

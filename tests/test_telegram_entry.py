@@ -16,7 +16,7 @@ def test_telegram_router_handles_start_plain_message_and_run_command(tmp_path: P
     assert "AgentEnd" in router.handle_text(chat_id="chat-1", user_id="user-1", text="/start")
     assert "Echo: hello" in router.handle_text(chat_id="chat-1", user_id="user-1", text="hello")
     assert "simple_chat" in router.handle_text(chat_id="chat-1", user_id="user-1", text="/workflows")
-    assert "Echo: from telegram" in router.handle_text(
+    assert "Fake LLM: from telegram" in router.handle_text(
         chat_id="chat-1",
         user_id="user-1",
         text="/run simple_chat from telegram",

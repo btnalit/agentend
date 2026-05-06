@@ -9,13 +9,14 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from agentend.core.action_policy import record_action_decision
 from agentend.core.events import record_event
-from agentend.core.tool_contracts import snapshot_tool_contracts, sync_tool_manifests
+from agentend.core.tool_contracts import effective_side_effect, snapshot_tool_contracts, sync_tool_manifests
 from agentend.core.tool_registry import ToolRegistry
 from agentend.db.models import Conversation, Run, RunStep, ToolCall, ToolContractSnapshot
 
 
-BLOCKED_REPLAY_SIDE_EFFECTS = {"network_write", "external_write"}
+BLOCKED_REPLAY_SIDE_EFFECTS = {"local_write", "local_execute", "network_write", "external_write"}
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,7 @@ def execute_replay_plan(home: Path, session: Session, source_run_id: str) -> Rep
     record_event(session, "run.replay_planned", {"source_run_id": source_run_id, "status": plan["status"]}, run_id=run.id)
 
     if plan["status"] != "ready":
+        _record_blocked_replay_decisions(session, run_id=run.id, plan=plan)
         run.status = "failed"
         run.error = str(plan["failure_reason"])
         run.result_json = json.dumps({"error": run.error, "replay_report": plan}, ensure_ascii=False, sort_keys=True)
@@ -172,6 +174,7 @@ def _plan_tool_step(
         }
 
     side_effect = str(source_contract.get("side_effect") or current_contract.get("side_effect") or "none")
+    side_effect = effective_side_effect(tool_call.tool_name, _json_or_empty(tool_call.input_json), side_effect)
     if side_effect in BLOCKED_REPLAY_SIDE_EFFECTS:
         return base | {
             "strategy": "block",
@@ -237,6 +240,27 @@ def _copy_reused_steps(session: Session, *, replay_run_id: str, plan: dict[str, 
                 latency_ms=0,
             )
         )
+
+
+def _record_blocked_replay_decisions(session: Session, *, run_id: str, plan: dict[str, Any]) -> None:
+    for step in plan["steps"]:
+        if step.get("strategy") != "block":
+            continue
+        side_effect = str(step.get("side_effect") or "")
+        tool_name = str(step.get("tool_name") or "")
+        if not side_effect or not tool_name:
+            continue
+        try:
+            record_action_decision(
+                session,
+                run_id=run_id,
+                step_id=None,
+                tool_name=tool_name,
+                side_effect=side_effect,
+                run_mode="replay",
+            )
+        except PermissionError:
+            continue
 
 
 def _contract_diff(source_contract: dict[str, Any], current_contract: dict[str, Any]) -> list[str]:

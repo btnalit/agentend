@@ -35,11 +35,14 @@ agentend llm set --provider openai --model gpt-4.1
 agentend llm test
 ```
 
+`llm test` 会向配置的 OpenAI-compatible `/chat/completions` 端点发送最小请求；workflow 中的 LLM step 也会使用同一 provider。自定义兼容端点可编辑 `config.toml` 中的 `[llm.providers.openai].base_url` 和 `api_key_env`。
+
 ## 常用 CLI
 
 ```bash
 agentend init
 agentend status
+agentend doctor
 agentend chat
 agentend chat --message "hello"
 
@@ -61,10 +64,34 @@ agentend runs list
 agentend runs show <run_id>
 agentend runs resume <run_id> --message "补充信息"
 agentend runs cancel <run_id>
+agentend runs export <run_id> --output ./exports
 
 agentend logs tail
 agentend db backup --output ./agentend.sqlite.bak
 ```
+
+## 运行边界和审计
+
+- 文件工具默认只允许访问 AgentEnd home 内的相对路径；`file.write_text` 和 browser screenshot/click/type 产物写入 `data/artifacts/<run_id>/`。
+- `fs.delete recursive=true` 不能删除 AgentEnd home root；绝对路径和 `..` 越界路径会被拒绝。
+- ToolRegistry 会为每次工具调用记录 Tool Contract snapshot、Action Policy decision、tool call、event log 和必要的 artifact。
+- `http.request` 按 method 动态分类副作用：GET/HEAD/OPTIONS 是 `network_read`，POST/PUT/PATCH/DELETE 是 `network_write`。
+- Result Cache 只缓存网络读结果；Replay 默认阻断本地写入/执行和网络写入，Scheduler 默认阻断本地执行、网络写入和外部写入。
+- `sources list/show` 和 `runs export` 会输出 web、file、browser 来源证据；secret 和 AgentEnd home 路径会尽量脱敏。
+
+## Eval 和发布检查
+
+```bash
+agentend eval list
+agentend eval run runtime-hardening
+agentend eval report <eval_run_id>
+
+python -m compileall -q src tests
+python -m pytest tests -q
+git diff --check
+```
+
+`runtime-hardening` suite 使用本地 fixture 覆盖真实 LLM 调用链、Telegram + MCP、HTTP 副作用分类、路径边界、内置 Skill 工具调用、model route/cost usage 和 evidence export。
 
 ## MCP 接入
 
@@ -197,11 +224,12 @@ python -m pytest -q
 
 - 初始化幂等。
 - CLI 会话和 SQLite 持久化。
-- LLM 配置和 `agent.md` hash。
-- Workflow 校验和执行。
-- 内置工具、artifact 和 workflow_call。
+- OpenAI-compatible LLM fixture、LLM 配置和 `agent.md` hash。
+- Workflow 校验、final/condition 语义和执行。
+- 内置工具、Action Policy、artifact、evidence 和 workflow_call。
 - MCP 工具自动注册和调用。
-- Telegram router。
+- Telegram router 和 MCP async bridge。
 - Linux 部署产物和数据库备份。
 - run resume/cancel、failed run 和 event log。
+- runtime-hardening eval、tools-smoke、skills-smoke 和 context eval。
 

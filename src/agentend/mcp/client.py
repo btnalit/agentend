@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from typing import Any
 
 from agentend.db.models import MCPServer
@@ -10,10 +11,16 @@ from agentend.mcp.schemas import DiscoveredMCPTool, MCPCallResult
 
 class MCPClient:
     def list_tools(self, server: MCPServer) -> list[DiscoveredMCPTool]:
-        return asyncio.run(self._list_tools(server))
+        return _run_coro_sync(self.list_tools_async(server))
 
     def call_tool(self, server: MCPServer, tool_name: str, arguments: dict[str, Any]) -> MCPCallResult:
-        return asyncio.run(self._call_tool(server, tool_name, arguments))
+        return _run_coro_sync(self.call_tool_async(server, tool_name, arguments))
+
+    async def list_tools_async(self, server: MCPServer) -> list[DiscoveredMCPTool]:
+        return await self._list_tools(server)
+
+    async def call_tool_async(self, server: MCPServer, tool_name: str, arguments: dict[str, Any]) -> MCPCallResult:
+        return await self._call_tool(server, tool_name, arguments)
 
     async def _list_tools(self, server: MCPServer) -> list[DiscoveredMCPTool]:
         if server.transport == "stdio" and server.command == "mock:echo":
@@ -113,3 +120,25 @@ class MCPClient:
                 texts.append(str(text))
         content = "\n".join(texts) if texts else json.dumps(structured, ensure_ascii=False)
         return MCPCallResult(content=content, data={"content": content, "structured": structured})
+
+
+def _run_coro_sync(coro):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result: dict[str, Any] = {}
+
+    def runner() -> None:
+        try:
+            result["value"] = asyncio.run(coro)
+        except BaseException as exc:  # propagate the original exception to the caller thread
+            result["error"] = exc
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in result:
+        raise result["error"]
+    return result["value"]

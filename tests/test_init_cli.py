@@ -46,5 +46,5 @@ def test_status_reports_home_database_llm_and_agent_profile(tmp_path: Path) -> N
     assert result.exit_code == 0
     assert str(home.resolve()) in result.output
     assert "agentend.sqlite" in result.output
-    assert "openai" in result.output
+    assert "fake/fake-llm" in result.output
     assert "agent.md" in result.output

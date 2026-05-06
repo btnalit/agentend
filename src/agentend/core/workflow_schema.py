@@ -16,6 +16,9 @@ class WorkflowNode(BaseModel):
     workflow: str | None = None
     input: dict[str, Any] = Field(default_factory=dict)
     context: dict[str, Any] = Field(default_factory=dict)
+    then: list[str] = Field(default_factory=list)
+    else_: list[str] = Field(default_factory=list, alias="else")
+    branches: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class WorkflowDefinition(BaseModel):
@@ -38,6 +41,15 @@ class WorkflowDefinition(BaseModel):
             missing = [dep for dep in node.depends_on if dep not in seen]
             if missing:
                 raise ValueError(f"node {node.id} depends on unknown nodes: {missing}")
+            branch_targets = [*node.then, *node.else_]
+            for branch in node.branches.values():
+                branch_targets.extend(branch)
+            missing_branches = [target for target in branch_targets if target not in seen]
+            if missing_branches:
+                raise ValueError(f"node {node.id} branches to unknown nodes: {missing_branches}")
+        final_nodes = [node for node in self.nodes if node.type == "final"]
+        if len(final_nodes) != 1:
+            raise ValueError("workflow must contain exactly one final node")
         return self
 
 

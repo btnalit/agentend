@@ -1,5 +1,5 @@
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -13,6 +13,7 @@ from agentend.core.context_runtime import create_checkpoint, estimate_tokens, re
 from agentend.core.errors import record_error
 from agentend.core.events import record_event
 from agentend.core.llm_router import LLMRouter
+from agentend.core.model_routing import record_cost_usage, resolve_model_route
 from agentend.core.profile import load_agent_profile
 from agentend.core.replanner import record_replan_suggestion, replan_failure
 from agentend.core.tool_contracts import snapshot_tool_contracts, sync_tool_manifests
@@ -59,6 +60,7 @@ class WorkflowRunner:
         llm = LLMRouter(config)
         tools = ToolRegistry(self.home)
         outputs: dict[str, str] = {}
+        skipped: set[str] = set()
         result: WorkflowRunResult | None = None
         failure: WorkflowRunFailed | None = None
 
@@ -93,18 +95,29 @@ class WorkflowRunner:
             active_node_id = ""
             try:
                 for node in self._ordered_nodes(workflow):
+                    if self._should_skip_node(node, skipped):
+                        skipped.add(node.id)
+                        self._record_skipped_step(session, run.id, node)
+                        continue
                     active_node_id = node.id
                     output = self._run_node(session, run.id, node, user_input, outputs, llm, tools, run_mode=run_mode, workflow_context=workflow)
                     outputs[node.id] = output
+                    skipped.update(self._unselected_branch_nodes(node, output))
                     if node.type == "human_input":
                         run.status = "waiting_input"
                         run.result_json = json.dumps({"prompt": output}, ensure_ascii=False)
                         record_event(session, "run.state_changed", {"status": "waiting_input"}, run_id=run.id)
                         result = WorkflowRunResult(run_id=run.id, output=output)
                         break
+                    if node.type == "final":
+                        run.status = "completed"
+                        run.result_json = json.dumps({"content": output}, ensure_ascii=False)
+                        record_event(session, "run.completed", {"workflow_id": workflow.id}, run_id=run.id)
+                        result = WorkflowRunResult(run_id=run.id, output=output)
+                        break
 
                 if result is None:
-                    final_output = outputs[workflow.nodes[-1].id]
+                    final_output = outputs[self._final_node(workflow).id]
                     run.status = "completed"
                     run.result_json = json.dumps({"content": final_output}, ensure_ascii=False)
                     record_event(session, "run.completed", {"workflow_id": workflow.id}, run_id=run.id)
@@ -244,6 +257,8 @@ class WorkflowRunner:
             if node.type == "llm":
                 prompt = (node.prompt or "{input}").format(input=user_input, **outputs)
                 resolved_workflow_context = workflow_context or self._workflow_for_context(session, run_id)
+                route = resolve_model_route(llm.config, session, "workflow_step")
+                routed_llm = LLMRouter(self._config_for_route(llm.config, route.provider, route.model))
                 ledger = record_context_ledger(
                     session,
                     self.home,
@@ -253,13 +268,15 @@ class WorkflowRunner:
                     user_input=user_input,
                     prompt=prompt,
                     model_stage="workflow_step",
-                    model_provider=llm.config.llm.provider,
-                    model_model=llm.config.llm.model,
+                    model_provider=route.provider,
+                    model_model=route.model,
                     step_policy=node.context,
                 )
                 self._check_budget_after_context(session, run_id, ledger)
-                output = llm.complete(prompt)
-                self._check_output_budget(session, run_id, output)
+                response = routed_llm.complete_response(prompt)
+                self._record_llm_usage(session, run_id=run_id, step_id=step.id, ledger=ledger, response=response)
+                self._check_output_budget(session, run_id, response.usage.output_tokens)
+                output = response.content
             elif node.type == "tool":
                 if node.tool is None:
                     raise ValueError(f"Tool node {node.id} is missing tool")
@@ -306,7 +323,7 @@ class WorkflowRunner:
                 record_event(session, "step.completed", {"node_id": persisted_node_id}, run_id=run_id)
                 return output
             elif node.type == "final":
-                output = outputs[node.depends_on[-1]] if node.depends_on else user_input
+                output = self._final_output(node, outputs, user_input)
             else:
                 raise ValueError(f"Unsupported node type for this runner slice: {node.type}")
 
@@ -333,7 +350,12 @@ class WorkflowRunner:
         run_mode: str = "normal",
     ) -> str:
         outputs: dict[str, str] = {}
+        skipped: set[str] = set()
         for node in self._ordered_nodes(workflow):
+            if self._should_skip_node(node, skipped):
+                skipped.add(node.id)
+                self._record_skipped_step(session, run_id, node, prefix=prefix)
+                continue
             outputs[node.id] = self._run_node(
                 session,
                 run_id,
@@ -346,7 +368,10 @@ class WorkflowRunner:
                 run_mode=run_mode,
                 workflow_context=workflow,
             )
-        return outputs[workflow.nodes[-1].id]
+            skipped.update(self._unselected_branch_nodes(node, outputs[node.id]))
+            if node.type == "final":
+                return outputs[node.id]
+        return outputs[self._final_node(workflow).id]
 
     def _render_data(self, value: object, user_input: str, outputs: dict[str, str]) -> object:
         if isinstance(value, str):
@@ -372,21 +397,32 @@ class WorkflowRunner:
     ) -> WorkflowRunResult:
         skipping = start_after_node is not None
         active_node_id = ""
+        skipped_nodes = self._skipped_outputs_for_workflow(session, run.id)
         for node in self._ordered_nodes(workflow):
             if skipping:
                 if node.id == start_after_node:
                     skipping = False
                 continue
+            if self._should_skip_node(node, skipped_nodes):
+                skipped_nodes.add(node.id)
+                self._record_skipped_step(session, run.id, node)
+                continue
             active_node_id = node.id
             output = self._run_node(session, run.id, node, user_input, outputs, llm, tools, run_mode=run_mode, workflow_context=workflow)
             outputs[node.id] = output
+            skipped_nodes.update(self._unselected_branch_nodes(node, output))
             if node.type == "human_input":
                 run.status = "waiting_input"
                 run.result_json = json.dumps({"prompt": output}, ensure_ascii=False)
                 record_event(session, "run.state_changed", {"status": "waiting_input"}, run_id=run.id)
                 return WorkflowRunResult(run_id=run.id, output=output)
+            if node.type == "final":
+                run.status = "completed"
+                run.result_json = json.dumps({"content": output}, ensure_ascii=False)
+                record_event(session, "run.completed", {"workflow_id": workflow.id, "resumed": True}, run_id=run.id)
+                return WorkflowRunResult(run_id=run.id, output=output)
 
-        final_node_id = workflow.nodes[-1].id
+        final_node_id = self._final_node(workflow).id
         if final_node_id not in outputs:
             raise ValueError(f"Checkpoint cannot resume workflow after node: {start_after_node}")
         final_output = outputs[final_node_id]
@@ -426,6 +462,39 @@ class WorkflowRunner:
             elif "prompt" in payload:
                 outputs[step.node_id] = str(payload["prompt"])
         return outputs
+
+    def _skipped_outputs_for_workflow(self, session: Session, run_id: str) -> set[str]:
+        skipped: set[str] = set()
+        steps = session.execute(select(RunStep).where(RunStep.run_id == run_id).order_by(RunStep.created_at)).scalars().all()
+        for step in steps:
+            if step.status == "skipped":
+                skipped.add(step.node_id)
+        return skipped
+
+    def _record_skipped_step(self, session: Session, run_id: str, node: WorkflowNode, *, prefix: str = "") -> None:
+        node_id = f"{prefix}{node.id}"
+        existing = (
+            session.execute(
+                select(RunStep)
+                .where(RunStep.run_id == run_id)
+                .where(RunStep.node_id == node_id)
+                .where(RunStep.status == "skipped")
+            )
+            .scalars()
+            .first()
+        )
+        if existing is not None:
+            return
+        step = RunStep(
+            id=str(uuid4()),
+            run_id=run_id,
+            node_id=node_id,
+            status="skipped",
+            input_json=json.dumps({"reason": "condition branch not selected"}, ensure_ascii=False),
+            output_json="{}",
+        )
+        session.add(step)
+        record_event(session, "step.skipped", {"node_id": node_id}, run_id=run_id)
 
     def _mark_run_failed(
         self,
@@ -490,11 +559,10 @@ class WorkflowRunner:
                 f"max_input_tokens exceeded for {budget.workflow_id} ({ledger.estimated_input_tokens} > {budget.max_input_tokens})"
             )
 
-    def _check_output_budget(self, session: Session, run_id: str, output: str) -> None:
+    def _check_output_budget(self, session: Session, run_id: str, output_tokens: int) -> None:
         budget = self._budget_for_run(session, run_id)
         if budget is None or budget.max_output_tokens is None:
             return
-        output_tokens = estimate_tokens(output)
         if output_tokens > budget.max_output_tokens:
             raise BudgetExceeded(
                 f"budget_exceeded: max_output_tokens exceeded for {budget.workflow_id} ({output_tokens} > {budget.max_output_tokens})"
@@ -520,6 +588,41 @@ class WorkflowRunner:
                 remaining.remove(node)
         return ordered
 
+    def _final_node(self, workflow: WorkflowDefinition) -> WorkflowNode:
+        final_nodes = [node for node in workflow.nodes if node.type == "final"]
+        if len(final_nodes) != 1:
+            raise ValueError("workflow must contain exactly one final node")
+        return final_nodes[0]
+
+    def _final_output(self, node: WorkflowNode, outputs: dict[str, str], user_input: str) -> str:
+        for dep in reversed(node.depends_on):
+            if dep in outputs:
+                return outputs[dep]
+        if node.depends_on:
+            raise ValueError(f"Final node {node.id} has no completed dependencies")
+        return user_input
+
+    def _should_skip_node(self, node: WorkflowNode, skipped: set[str]) -> bool:
+        if node.id in skipped:
+            return True
+        if node.type == "final":
+            return False
+        return any(dep in skipped for dep in node.depends_on)
+
+    def _unselected_branch_nodes(self, node: WorkflowNode, output: str) -> set[str]:
+        if node.type != "condition":
+            return set()
+        selected = set(self._selected_branch_nodes(node, output))
+        all_branch_nodes = set(node.then) | set(node.else_)
+        for targets in node.branches.values():
+            all_branch_nodes.update(targets)
+        return all_branch_nodes - selected
+
+    def _selected_branch_nodes(self, node: WorkflowNode, output: str) -> list[str]:
+        if node.branches:
+            return node.branches.get(output, [])
+        return node.then if output == "true" else node.else_
+
     def _persist_workflow_def(self, session: Session, workflow: WorkflowDefinition) -> None:
         existing = session.get(WorkflowDef, workflow.id)
         payload = workflow.model_dump_json(indent=2)
@@ -544,3 +647,37 @@ class WorkflowRunner:
             return WorkflowRegistry(load_config(self.home)).get(run.workflow_id)
         except Exception:
             return None
+
+    def _config_for_route(self, config, provider: str, model: str):
+        provider_config = config.llm.providers.get(provider)
+        if provider_config is None:
+            provider_config = config.llm.provider_config if provider == config.llm.provider else config.llm.providers.get("openai")
+        if provider_config is None:
+            provider_config = config.llm.provider_config
+        llm_config = replace(
+            config.llm,
+            provider=provider,
+            model=model,
+            provider_config=provider_config,
+        )
+        return replace(config, llm=llm_config)
+
+    def _record_llm_usage(self, session: Session, *, run_id: str, step_id: str, ledger: ContextLedger, response) -> None:
+        usage_source = "provider" if response.provider != "fake" else "estimated"
+        record_cost_usage(
+            session,
+            run_id=run_id,
+            step_id=step_id,
+            workflow_id=self._workflow_id_for_run(session, run_id),
+            model_stage=ledger.model_stage,
+            provider=ledger.model_provider,
+            model=ledger.model_model,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            total_tokens=response.usage.total_tokens,
+            usage_source=usage_source,
+        )
+
+    def _workflow_id_for_run(self, session: Session, run_id: str) -> str | None:
+        run = session.get(Run, run_id)
+        return run.workflow_id if run is not None else None

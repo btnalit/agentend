@@ -41,8 +41,10 @@ def get_cached_result(
     context: ToolContext,
     tool_name: str,
     input_data: dict[str, Any],
+    *,
+    side_effect: str | None = None,
 ) -> ToolResult | None:
-    if tool_name not in CACHEABLE_TOOLS:
+    if tool_name not in CACHEABLE_TOOLS or side_effect not in {None, "network_read"}:
         return None
     cache_key, _ = cache_key_for_tool(context, tool_name, input_data)
     row = session.get(ResultCache, cache_key)
@@ -69,8 +71,10 @@ def store_cached_result(
     tool_name: str,
     input_data: dict[str, Any],
     result: ToolResult,
+    *,
+    side_effect: str | None = None,
 ) -> None:
-    if tool_name not in CACHEABLE_TOOLS:
+    if tool_name not in CACHEABLE_TOOLS or side_effect not in {None, "network_read"}:
         return
     cache_key, input_hash = cache_key_for_tool(context, tool_name, input_data)
     ttl_seconds = int(input_data.get("cache_ttl_seconds", 3600))

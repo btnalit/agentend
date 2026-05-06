@@ -9,12 +9,18 @@ from sqlalchemy import select
 
 from agentend.core.action_policy import record_action_decision
 from agentend.core.context_runtime import compact_tool_result
-from agentend.core.evidence import rehydrate_cached_evidence
+from agentend.core.evidence import attach_artifact_to_sources, rehydrate_cached_evidence
 from agentend.core.errors import record_error
 from agentend.core.events import record_event
 from agentend.core.result_cache import get_cached_result, store_cached_result
 from agentend.core.secrets import redact_text
-from agentend.core.tool_contracts import ToolContract, contract_for_tool, snapshot_tool_contracts, sync_tool_manifests
+from agentend.core.tool_contracts import (
+    ToolContract,
+    contract_for_tool,
+    effective_side_effect,
+    snapshot_tool_contracts,
+    sync_tool_manifests,
+)
 from agentend.db.models import Artifact, MCPTool, ToolCall, ToolManifest
 from agentend.db.session import session_scope
 from agentend.mcp.adapter import MCPRegisteredTool
@@ -101,19 +107,21 @@ class ToolRegistry:
         context.session.add(call)
         record_event(context.session, "tool.called", {"tool_name": name}, run_id=context.run_id)
         try:
+            static_side_effect = manifest.side_effect if manifest is not None else "none"
+            side_effect = effective_side_effect(name, input_data, static_side_effect)
             if manifest is not None:
                 record_action_decision(
                     context.session,
                     run_id=context.run_id,
                     step_id=context.step_id,
                     tool_name=name,
-                    side_effect=manifest.side_effect,
+                    side_effect=side_effect,
                     run_mode=context.run_mode,
                 )
-            cached = get_cached_result(context.session, context, name, input_data)
+            cached = get_cached_result(context.session, context, name, input_data, side_effect=side_effect)
             result = rehydrate_cached_evidence(context.session, context, name, cached) if cached is not None else self.get(name).call(input_data, context)
             if cached is None:
-                store_cached_result(context.session, context, name, input_data, result)
+                store_cached_result(context.session, context, name, input_data, result, side_effect=side_effect)
             call.status = "completed"
             call.output_json = redact_text(
                 context.home,
@@ -128,7 +136,8 @@ class ToolRegistry:
                 result=result,
             )
             if result.artifact_path is not None:
-                self._record_artifact(result.artifact_path, result, context)
+                artifact = self._record_artifact(result.artifact_path, result, context)
+                attach_artifact_to_sources(context.session, run_id=context.run_id, payload=result.data, artifact_id=artifact.id)
             return result
         except Exception as exc:
             call.status = "failed"
@@ -137,22 +146,22 @@ class ToolRegistry:
             call.latency_ms = int((time.perf_counter() - started) * 1000)
             raise
 
-    def _record_artifact(self, path: Path, result: ToolResult, context: ToolContext) -> None:
+    def _record_artifact(self, path: Path, result: ToolResult, context: ToolContext) -> Artifact:
         digest = result.data.get("sha256")
         if digest is None and path.exists():
             digest = sha256(path.read_bytes()).hexdigest()
-        context.session.add(
-            Artifact(
-                id=str(uuid4()),
-                run_id=context.run_id,
-                path=str(path),
-                kind="file",
-                mime="text/plain",
-                size_bytes=int(result.data.get("size_bytes", path.stat().st_size if path.exists() else 0)),
-                sha256=digest,
-                metadata_json=json.dumps(result.data, ensure_ascii=False, sort_keys=True),
-            )
+        artifact = Artifact(
+            id=str(uuid4()),
+            run_id=context.run_id,
+            path=str(path),
+            kind="file",
+            mime="text/plain",
+            size_bytes=int(result.data.get("size_bytes", path.stat().st_size if path.exists() else 0)),
+            sha256=digest,
+            metadata_json=json.dumps(result.data, ensure_ascii=False, sort_keys=True),
         )
+        context.session.add(artifact)
+        return artifact
 
     def _register_mcp_tools(self, home: Path) -> None:
         with session_scope(home) as session:

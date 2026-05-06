@@ -27,6 +27,10 @@ def classify_exception(exc: Exception) -> ClassifiedError:
         return ClassifiedError("missing_config", message, False, "Configure the missing setting or secret.")
     if "timeout" in lowered or isinstance(exc, TimeoutError):
         return ClassifiedError("timeout", message, True, "Retry or increase the timeout.")
+    if "status 401" in lowered or "status 403" in lowered or "unauthorized" in lowered or "forbidden" in lowered:
+        return ClassifiedError("permission_error", message, False, "Check provider credentials and permissions.")
+    if "status 5" in lowered or "network error" in lowered or "provider request failed" in lowered:
+        return ClassifiedError("network_error", message, True, "Retry or switch provider.")
     if isinstance(exc, PermissionError) or "blocked" in lowered or "permission" in lowered:
         return ClassifiedError("permission_error", message, False, "Adjust the action policy or request user input.")
     if isinstance(exc, (KeyError, TypeError, ValueError)) and "unknown tool" not in lowered:

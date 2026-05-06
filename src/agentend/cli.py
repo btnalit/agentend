@@ -61,6 +61,7 @@ from agentend.db.models import (
     ContextLedger,
     ContextPackItem,
     CostBudget,
+    CostUsage,
     Episode,
     EvalRun,
     EventLog,
@@ -724,7 +725,15 @@ def budget_show(
         if not rows:
             typer.echo("No budgets.")
         for row in rows:
-            typer.echo(f"{row.workflow_id}: max_llm_calls={row.max_llm_calls or '-'}")
+            usage_rows = session.execute(select(CostUsage).where(CostUsage.workflow_id == row.workflow_id)).scalars().all()
+            input_tokens = sum(item.input_tokens for item in usage_rows)
+            output_tokens = sum(item.output_tokens for item in usage_rows)
+            total_tokens = sum(item.total_tokens for item in usage_rows)
+            typer.echo(
+                f"{row.workflow_id}: max_llm_calls={row.max_llm_calls or '-'} "
+                f"usage_calls={len(usage_rows)} input_tokens={input_tokens} "
+                f"output_tokens={output_tokens} total_tokens={total_tokens}"
+            )
 
 
 @eval_app.command("list")

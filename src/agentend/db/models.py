@@ -222,6 +222,23 @@ class CostBudget(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
 
 
+class CostUsage(Base):
+    __tablename__ = "cost_usage"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), nullable=False, index=True)
+    step_id: Mapped[str | None] = mapped_column(ForeignKey("run_steps.id"), nullable=True, index=True)
+    workflow_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    model_stage: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    usage_source: Mapped[str] = mapped_column(String(32), default="estimated", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class EvalRun(Base):
     __tablename__ = "eval_runs"
 

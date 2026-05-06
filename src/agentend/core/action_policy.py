@@ -15,7 +15,9 @@ class ActionDecision:
 
 
 def decide_action(*, side_effect: str, run_mode: str = "normal") -> ActionDecision:
-    if run_mode in {"replay", "scheduler"} and side_effect in {"network_write", "external_write"}:
+    if run_mode == "replay" and side_effect in {"local_write", "local_execute", "network_write", "external_write"}:
+        return ActionDecision("block", f"{side_effect} is blocked during {run_mode}.")
+    if run_mode == "scheduler" and side_effect in {"local_execute", "network_write", "external_write"}:
         return ActionDecision("block", f"{side_effect} is blocked during {run_mode}.")
     return ActionDecision("allow", f"{side_effect} is allowed for {run_mode} runs.")
 

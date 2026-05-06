@@ -57,6 +57,8 @@ BUILTIN_SIDE_EFFECTS = {
     "vision.extract_chart": "network_read",
 }
 
+HTTP_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+
 
 @dataclass(frozen=True)
 class ToolContract:
@@ -105,6 +107,13 @@ def contract_for_tool(tool: Tool, *, source: str = "builtin", enabled: bool = Tr
         retryable=side_effect in {"network_read"},
         artifact_policy="capture_artifact" if tool.name in {"file.write_text", "browser.screenshot", "browser.click", "browser.type"} else "none",
     )
+
+
+def effective_side_effect(tool_name: str, input_data: dict[str, Any], default_side_effect: str) -> str:
+    if tool_name == "http.request":
+        method = str(input_data.get("method", "GET")).upper()
+        return "network_read" if method in HTTP_READ_METHODS else "network_write"
+    return default_side_effect
 
 
 def sync_tool_manifests(session: Session, contracts: list[ToolContract]) -> None:

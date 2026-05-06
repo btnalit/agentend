@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from hashlib import sha256
 from importlib.util import find_spec
 from pathlib import Path
 from urllib.parse import urljoin
 
 import httpx
 
+from agentend.core.evidence import record_browser_extract_evidence, record_browser_screenshot_evidence
+from agentend.core.paths import safe_artifact_path
 from agentend.tools.base import ToolContext, ToolResult
 
 
@@ -45,6 +48,14 @@ class BrowserExtractTool:
 
     def call(self, input_data: dict, context: ToolContext) -> ToolResult:
         page = _load_page(str(input_data["url"]))
+        source = record_browser_extract_evidence(
+            context.session,
+            context.home,
+            run_id=context.run_id,
+            url=page["url"],
+            title=page["title"],
+            text=page["text"],
+        )
         data = {
             "url": page["url"],
             "title": page["title"],
@@ -54,6 +65,7 @@ class BrowserExtractTool:
             "dom_excerpt": page["text"][:1000],
             "fallback": page.get("fallback", False),
             "fallback_reason": page.get("fallback_reason"),
+            "source_id": source.id,
         }
         return ToolResult(content=json.dumps(data, ensure_ascii=False, indent=2), data=data)
 
@@ -81,6 +93,18 @@ class BrowserScreenshotTool:
                 "dom_excerpt": page["text"][:1000],
                 "size_bytes": output.stat().st_size,
             }
+        digest = sha256(output.read_bytes()).hexdigest()
+        source = record_browser_screenshot_evidence(
+            context.session,
+            context.home,
+            run_id=context.run_id,
+            url=str(data.get("url") or url),
+            title=data.get("title") if data.get("title") is not None else None,
+            path=output,
+            dom_excerpt=str(data.get("dom_excerpt") or ""),
+            content_hash=digest,
+        )
+        data = data | {"sha256": digest, "source_id": source.id}
         return ToolResult(content=str(output), data=data, artifact_path=output)
 
 
@@ -289,10 +313,7 @@ def _selector_exists(html: str, selector: str) -> bool:
 
 
 def _artifact_path(context: ToolContext, requested: str) -> Path:
-    path = Path(requested)
-    if path.is_absolute():
-        return path
-    return context.home / "data" / "artifacts" / context.run_id / path.name
+    return safe_artifact_path(context.home, context.run_id, requested)
 
 
 def _placeholder_png() -> bytes:

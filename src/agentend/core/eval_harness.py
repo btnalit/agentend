@@ -6,6 +6,7 @@ import re
 import sqlite3
 import sys
 import threading
+import asyncio
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,7 +20,9 @@ from sqlalchemy.orm import Session
 from agentend.config import load_config
 from agentend.core.evidence import evidence_manifest_for_run
 from agentend.core.errors import classify_exception
+from agentend.core.llm_router import LLMRouter
 from agentend.core.memory_store import write_memory_item
+from agentend.core.model_routing import set_route
 from agentend.core.skills import ensure_builtin_skills, load_skill_bundle
 from agentend.core.tool_contracts import snapshot_to_dict
 from agentend.core.tool_registry import ToolRegistry
@@ -35,8 +38,11 @@ from agentend.db.models import (
     ContextPackItem,
     ContextPolicy,
     ContextSummary,
+    CostUsage,
     EvalRun,
+    EvidenceLink,
     MemoryRetrieval,
+    ResultCache,
     Run,
     RunExport,
     RunStep,
@@ -46,13 +52,15 @@ from agentend.db.models import (
     ToolContractSnapshot,
 )
 from agentend.db.session import session_scope
+from agentend.mcp.manager import MCPManager
+from agentend.telegram_bot import TelegramMessageRouter
 from agentend.tools.base import ToolContext
 
 
 CONTEXT_SMOKE_INPUT = "agentend context smoke anchor"
 CONTEXT_SMOKE_MEMORY = "agentend context smoke anchor project memory"
 CONTEXT_SMOKE_WORKFLOW = "context_smoke_eval"
-EVAL_SUITES = ("smoke", "context-smoke", "context-long", "tools-smoke", "skills-smoke")
+EVAL_SUITES = ("smoke", "context-smoke", "context-long", "tools-smoke", "skills-smoke", "runtime-hardening")
 PNG_1X1 = bytes.fromhex(
     "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
     "0000000c4944415408d7636060600000000400010d0a2db40000000049454e44ae426082"
@@ -89,6 +97,8 @@ def run_eval_suite(
         payload = _run_tools_smoke_suite(home)
     elif suite == "skills-smoke":
         payload = _run_skills_smoke_suite(home, skill=skill, skill_path=skill_path)
+    elif suite == "runtime-hardening":
+        payload = _run_runtime_hardening_suite(home)
     else:
         raise ValueError(f"Unknown eval suite: {suite}")
 
@@ -502,6 +512,322 @@ def _run_skills_smoke_suite(home: Path, *, skill: str | None = None, skill_path:
     return _suite_payload("skills-smoke", cases)
 
 
+def _run_runtime_hardening_suite(home: Path) -> dict[str, object]:
+    resolved_home = home.expanduser().resolve()
+    cases = [
+        _run_runtime_llm_fixture_case(resolved_home),
+        _run_runtime_telegram_mcp_case(resolved_home),
+        _run_runtime_http_side_effect_case(resolved_home),
+        _run_runtime_path_boundary_case(resolved_home),
+        _run_runtime_skill_tool_usage_case(resolved_home),
+        _run_runtime_model_route_case(resolved_home),
+        _run_runtime_evidence_case(resolved_home),
+    ]
+    return _suite_payload("runtime-hardening", cases)
+
+
+def _run_runtime_llm_fixture_case(home: Path) -> dict[str, object]:
+    case_id = "llm-openai-compatible"
+    run_id = ""
+    output = ""
+    error = ""
+    test_ok = False
+    usage: CostUsage | None = None
+    previous_config = ""
+    key_name = "AGENTEND_RUNTIME_LLM_KEY"
+    previous_key = os.environ.get(key_name)
+    with _runtime_llm_fixture() as fixture:
+        try:
+            previous_config = _configure_runtime_openai_llm(home, fixture.base_url, key_name)
+            os.environ[key_name] = "runtime-hardening-secret"
+            test_result = LLMRouter(load_config(home)).test()
+            test_ok = test_result.ok
+            if not test_result.ok:
+                error = test_result.message
+            workflow = load_workflow_yaml((home / "workflows" / "definitions" / "simple_chat.yaml").read_text(encoding="utf-8"))
+            result = WorkflowRunner(home).run(workflow, "runtime-hardening-llm", channel="eval")
+            run_id = result.run_id
+            output = result.output
+        except WorkflowRunFailed as exc:
+            run_id = exc.run_id
+            error = exc.message
+        except Exception as exc:
+            error = str(exc)
+        finally:
+            if previous_config:
+                (home / "config.toml").write_text(previous_config, encoding="utf-8")
+            if previous_key is None:
+                os.environ.pop(key_name, None)
+            else:
+                os.environ[key_name] = previous_key
+
+    if run_id:
+        with session_scope(home) as session:
+            usage = (
+                session.execute(select(CostUsage).where(CostUsage.run_id == run_id).order_by(CostUsage.created_at.desc()))
+                .scalars()
+                .first()
+            )
+
+    assertions = [
+        _assertion("llm test hits local OpenAI-compatible fixture", test_ok, error),
+        _assertion("workflow uses fixture response", "runtime fixture: runtime-hardening-llm" in output, error),
+        _assertion("test and workflow both request fixture", fixture.requests == ["ping", "runtime-hardening-llm"], ", ".join(fixture.requests)),
+        _assertion(
+            "provider usage is persisted",
+            usage is not None
+            and usage.provider == "openai"
+            and usage.model == "runtime-fixture-model"
+            and usage.usage_source == "provider"
+            and usage.total_tokens == 11,
+        ),
+    ]
+    return _runtime_case(home, case_id, run_id, {"result_preview": output[:300], "error": error}, assertions)
+
+
+def _run_runtime_telegram_mcp_case(home: Path) -> dict[str, object]:
+    case_id = "telegram-mcp-async"
+    workflow_path = home / "workflows" / "definitions" / "runtime_mcp_demo.yaml"
+    workflow_path.write_text(
+        """id: runtime_mcp_demo
+name: Runtime MCP Demo
+nodes:
+  - id: echo
+    type: tool
+    tool: mcp.runtime_demo.echo
+    input:
+      text: "Runtime MCP says {input}"
+  - id: final
+    type: final
+    depends_on: [echo]
+""",
+        encoding="utf-8",
+    )
+    reply = ""
+    run_id = ""
+    error = ""
+    try:
+        manager = MCPManager(home)
+        manager.add_stdio_server("runtime_demo", "mock:echo")
+        manager.refresh("runtime_demo")
+
+        async def _inside_loop() -> str:
+            return TelegramMessageRouter(home).handle_text("eval-chat", "eval-user", "/run runtime_mcp_demo hello")
+
+        reply = asyncio.run(_inside_loop())
+        run_id = _extract_run_id(reply)
+    except Exception as exc:
+        error = str(exc)
+    assertions = [
+        _assertion("telegram MCP workflow runs inside an event loop", "Runtime MCP says hello" in reply, error or reply),
+        _assertion("asyncio.run boundary does not leak", "asyncio.run() cannot be called" not in reply and "asyncio.run() cannot be called" not in error),
+        _assertion("telegram reply contains run id", bool(run_id), reply),
+    ]
+    return _runtime_case(home, case_id, run_id, {"result_preview": reply[:300], "error": error}, assertions)
+
+
+def _run_runtime_http_side_effect_case(home: Path) -> dict[str, object]:
+    case_id = "http-side-effect-policy"
+    with _http_method_fixture() as fixture:
+        get_input = {"url": fixture.url, "method": "GET"}
+        first_get = _run_runtime_tool_call(home, f"{case_id}.get.first", "http.request", get_input)
+        second_get = _run_runtime_tool_call(home, f"{case_id}.get.second", "http.request", get_input)
+        post = _run_runtime_tool_call(home, f"{case_id}.post", "http.request", {"url": fixture.url, "method": "POST", "json": {"ok": True}})
+    with session_scope(home) as session:
+        decisions = (
+            session.execute(
+                select(ActionPolicyDecision).where(
+                    ActionPolicyDecision.run_id.in_([first_get["run_id"], second_get["run_id"], post["run_id"]])
+                )
+            )
+            .scalars()
+            .all()
+        )
+        cache_rows = session.execute(select(ResultCache).where(ResultCache.tool_name == "http.request")).scalars().all()
+    assertions = [
+        _assertion("GET tool calls complete", first_get["status"] == "completed" and second_get["status"] == "completed", first_get["error"] or second_get["error"]),
+        _assertion("POST tool call completes in normal mode", post["status"] == "completed", post["error"]),
+        _assertion("GET is cached as network_read", fixture.get_count == 1 and any(row.hit_count >= 1 for row in cache_rows)),
+        _assertion("POST is classified as network_write", any(row.run_id == post["run_id"] and row.side_effect == "network_write" for row in decisions)),
+        _assertion("POST is not cached", fixture.post_count == 1 and len(cache_rows) == 1),
+    ]
+    return _runtime_case(
+        home,
+        case_id,
+        str(first_get["run_id"]),
+        {
+            "run_ids": [first_get["run_id"], second_get["run_id"], post["run_id"]],
+            "result_preview": json.dumps({"get_count": fixture.get_count, "post_count": fixture.post_count}, sort_keys=True),
+            "error": first_get["error"] or second_get["error"] or post["error"],
+        },
+        assertions,
+    )
+
+
+def _run_runtime_path_boundary_case(home: Path) -> dict[str, object]:
+    case_id = "path-boundary"
+    outside = home.parent / "agentend-outside-target"
+    fs_result = _run_runtime_tool_call(home, f"{case_id}.fs.delete", "fs.delete", {"path": str(outside), "recursive": True})
+    browser_result = _run_runtime_tool_call(
+        home,
+        f"{case_id}.browser.screenshot",
+        "browser.screenshot",
+        {"url": "http://127.0.0.1:1/", "path": str(outside / "shot.png")},
+    )
+    assertions = [
+        _assertion("fs absolute path is rejected", fs_result["status"] == "failed" and "relative to AgentEnd home" in fs_result["error"], fs_result["error"]),
+        _assertion(
+            "browser absolute artifact path is rejected",
+            browser_result["status"] == "failed" and "relative to the run artifact directory" in browser_result["error"],
+            browser_result["error"],
+        ),
+    ]
+    return _runtime_case(
+        home,
+        case_id,
+        str(fs_result["run_id"]),
+        {
+            "run_ids": [fs_result["run_id"], browser_result["run_id"]],
+            "result_preview": "",
+            "error": fs_result["error"] or browser_result["error"],
+        },
+        assertions,
+    )
+
+
+def _run_runtime_skill_tool_usage_case(home: Path) -> dict[str, object]:
+    case_id = "skill-tool-usage"
+    run_id = ""
+    output = ""
+    error = ""
+    try:
+        with session_scope(home) as session:
+            skill = next(row for row in ensure_builtin_skills(home, session) if row.id == "research.report")
+            workflow_path = Path(skill.workflow_path)
+        workflow = load_workflow_yaml(workflow_path.read_text(encoding="utf-8"))
+        result = WorkflowRunner(home).run(workflow, json.dumps({"topic": "runtime hardening"}, sort_keys=True), channel="eval-skill")
+        run_id = result.run_id
+        output = result.output
+    except WorkflowRunFailed as exc:
+        run_id = exc.run_id
+        error = exc.message
+    except Exception as exc:
+        error = str(exc)
+    with session_scope(home) as session:
+        calls = session.execute(select(ToolCall).where(ToolCall.run_id == run_id).order_by(ToolCall.created_at)).scalars().all() if run_id else []
+        sources = session.execute(select(SourceRecord).where(SourceRecord.used_by_run_id == run_id)).scalars().all() if run_id else []
+        artifacts = session.execute(select(Artifact).where(Artifact.run_id == run_id)).scalars().all() if run_id else []
+    tool_names = [call.tool_name for call in calls]
+    assertions = [
+        _assertion("research.report completes", bool(run_id) and not error, error),
+        _assertion("research.report calls required tools", tool_names == ["web.search", "web.fetch", "fs.write_text"], ", ".join(tool_names)),
+        _assertion("research.report records evidence", {source.source_type for source in sources} >= {"web_search", "web"}),
+        _assertion("research.report writes artifact", bool(artifacts)),
+    ]
+    return _runtime_case(home, case_id, run_id, {"result_preview": output[:300], "error": error}, assertions)
+
+
+def _run_runtime_model_route_case(home: Path) -> dict[str, object]:
+    case_id = "model-route-cost"
+    run_id = ""
+    output = ""
+    error = ""
+    try:
+        with session_scope(home) as session:
+            set_route(session, "workflow_step", "fake", "runtime-route-model")
+        workflow = load_workflow_yaml((home / "workflows" / "definitions" / "simple_chat.yaml").read_text(encoding="utf-8"))
+        result = WorkflowRunner(home).run(workflow, "runtime route check", channel="eval")
+        run_id = result.run_id
+        output = result.output
+    except WorkflowRunFailed as exc:
+        run_id = exc.run_id
+        error = exc.message
+    except Exception as exc:
+        error = str(exc)
+    with session_scope(home) as session:
+        ledger = _latest_context_ledger(session, run_id) if run_id else None
+        usage = (
+            session.execute(select(CostUsage).where(CostUsage.run_id == run_id).order_by(CostUsage.created_at.desc())).scalars().first()
+            if run_id
+            else None
+        )
+    assertions = [
+        _assertion("workflow route run completes", bool(run_id) and not error, error),
+        _assertion("context ledger records route model", ledger is not None and ledger.model_provider == "fake" and ledger.model_model == "runtime-route-model"),
+        _assertion("cost usage records route model", usage is not None and usage.provider == "fake" and usage.model == "runtime-route-model"),
+    ]
+    return _runtime_case(home, case_id, run_id, {"result_preview": output[:300], "error": error}, assertions)
+
+
+def _run_runtime_evidence_case(home: Path) -> dict[str, object]:
+    case_id = "evidence-export"
+    run_id = ""
+    output = ""
+    error = ""
+    export_path = ""
+    (home / "runtime-evidence.txt").write_text("runtime hardening local evidence", encoding="utf-8")
+    with _browser_fixture() as browser_url:
+        workflow_path = home / "workflows" / "definitions" / "runtime_evidence.yaml"
+        workflow_path.write_text(
+            f"""id: runtime_evidence
+name: Runtime Evidence
+nodes:
+  - id: fs_read
+    type: tool
+    tool: fs.read_text
+    input:
+      path: runtime-evidence.txt
+  - id: file_read
+    type: tool
+    tool: file.read_text
+    input:
+      path: runtime-evidence.txt
+  - id: extract
+    type: tool
+    tool: browser.extract
+    input:
+      url: "{browser_url}"
+  - id: screenshot
+    type: tool
+    tool: browser.screenshot
+    input:
+      url: "{browser_url}"
+      path: runtime-evidence.png
+  - id: final
+    type: final
+    depends_on: [fs_read, file_read, extract, screenshot]
+""",
+            encoding="utf-8",
+        )
+        try:
+            workflow = load_workflow_yaml(workflow_path.read_text(encoding="utf-8"))
+            result = WorkflowRunner(home).run(workflow, "runtime evidence", channel="eval")
+            run_id = result.run_id
+            output = result.output
+        except WorkflowRunFailed as exc:
+            run_id = exc.run_id
+            error = exc.message
+        except Exception as exc:
+            error = str(exc)
+    with session_scope(home) as session:
+        sources = session.execute(select(SourceRecord).where(SourceRecord.used_by_run_id == run_id)).scalars().all() if run_id else []
+        links = session.execute(select(EvidenceLink).where(EvidenceLink.run_id == run_id)).scalars().all() if run_id else []
+        if run_id:
+            export_path = _export_run(home, session, run_id, "runtime-hardening", case_id)
+            manifest = evidence_manifest_for_run(session, home, run_id)
+        else:
+            manifest = {"sources": [], "links": []}
+    source_types = [source.source_type for source in sources]
+    assertions = [
+        _assertion("evidence workflow completes", bool(run_id) and not error, error),
+        _assertion("file reads record sources", source_types.count("file_read") == 2, ", ".join(source_types)),
+        _assertion("browser extract records source", "browser_extract" in source_types, ", ".join(source_types)),
+        _assertion("browser screenshot records artifact source", "browser_screenshot" in source_types and any(link.artifact_id for link in links)),
+        _assertion("run export includes evidence manifest", bool(export_path) and len(manifest["sources"]) >= 4, export_path),
+    ]
+    return _runtime_case(home, case_id, run_id, {"export_path": export_path, "result_preview": output[:300], "error": error}, assertions)
+
+
 def _prepare_tools_smoke_files(home: Path) -> None:
     eval_dir = home / "data" / "eval"
     eval_dir.mkdir(parents=True, exist_ok=True)
@@ -575,6 +901,81 @@ def _run_tool_eval_case(home: Path, case: ToolEvalCase) -> dict[str, object]:
             },
             assertions,
         )
+
+
+def _run_runtime_tool_call(home: Path, title: str, tool_name: str, input_data: dict[str, Any]) -> dict[str, Any]:
+    registry = ToolRegistry(home)
+    with session_scope(home) as session:
+        conversation = Conversation(id=str(uuid4()), channel="eval", external_user_id="runtime-hardening", title=title)
+        run = Run(
+            id=str(uuid4()),
+            conversation_id=conversation.id,
+            workflow_id=f"eval.runtime.{title}",
+            status="running",
+            input_json=json.dumps({"tool": tool_name, "input": input_data}, ensure_ascii=False, sort_keys=True),
+            result_json="{}",
+        )
+        session.add(conversation)
+        session.add(run)
+        result_data: dict[str, Any] = {}
+        error = ""
+        try:
+            result = registry.call(tool_name, input_data, ToolContext(home, run.id, None, session))
+            result_data = result.data
+            run.status = "completed"
+            run.result_json = json.dumps(result.data | {"content": result.content}, ensure_ascii=False, sort_keys=True)
+        except Exception as exc:
+            classified = classify_exception(exc)
+            error = classified.message
+            run.status = "failed"
+            run.error = classified.message
+            run.result_json = json.dumps({"error_code": classified.code, "error": classified.message}, ensure_ascii=False, sort_keys=True)
+        session.flush()
+        return {"run_id": run.id, "status": run.status, "error": error, "data": result_data}
+
+
+def _runtime_case(
+    home: Path,
+    case_id: str,
+    run_id: str,
+    metadata: dict[str, object],
+    assertions: list[dict[str, str]],
+) -> dict[str, object]:
+    export_path = str(metadata.get("export_path") or "")
+    if any(assertion["status"] != "passed" for assertion in assertions) and run_id and not export_path:
+        with session_scope(home) as session:
+            export_path = _export_run(home, session, run_id, "runtime-hardening", case_id)
+        assertions.append(_assertion("failed eval run is exported", bool(export_path) and (Path(export_path) / "run.json").exists(), export_path))
+    return _case(case_id, {"run_id": run_id, **metadata, "export_path": export_path}, assertions)
+
+
+def _extract_run_id(text: str) -> str:
+    match = re.search(r"Run:\s+([0-9a-f-]+)", text)
+    return match.group(1) if match else ""
+
+
+def _configure_runtime_openai_llm(home: Path, base_url: str, api_key_env: str) -> str:
+    config_path = home / "config.toml"
+    original = config_path.read_text(encoding="utf-8")
+    end = original.find("\n[telegram]\n")
+    if end == -1:
+        raise ValueError("config.toml is missing [telegram] section")
+    replacement = f"""[llm]
+provider = "openai"
+model = "runtime-fixture-model"
+temperature = 0.2
+max_tokens = 64
+
+[llm.providers.fake]
+api_key_env = ""
+base_url = ""
+
+[llm.providers.openai]
+api_key_env = "{api_key_env}"
+base_url = "{base_url}"
+"""
+    config_path.write_text(replacement + original[end:], encoding="utf-8")
+    return original
 
 
 def _run_skill_eval_case(home: Path, *, skill_id: str, workflow_path: Path, input_payload: dict[str, Any]) -> dict[str, object]:
@@ -760,6 +1161,113 @@ def _safe_path_part(value: str) -> str:
 
 def _preview_json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)[:500]
+
+
+@contextmanager
+def _runtime_llm_fixture():
+    class Fixture:
+        def __init__(self) -> None:
+            self.requests: list[str] = []
+            self.server: ThreadingHTTPServer | None = None
+            self.thread: threading.Thread | None = None
+
+        @property
+        def base_url(self) -> str:
+            assert self.server is not None
+            return f"http://127.0.0.1:{self.server.server_port}/v1"
+
+    fixture = Fixture()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if self.path != "/v1/chat/completions" or self.headers.get("Authorization") != "Bearer runtime-hardening-secret":
+                self.send_response(401)
+                self.end_headers()
+                return
+            prompt = payload["messages"][0]["content"]
+            fixture.requests.append(prompt)
+            body = json.dumps(
+                {
+                    "model": payload["model"],
+                    "choices": [{"message": {"content": f"runtime fixture: {prompt}"}}],
+                    "usage": {"prompt_tokens": 4, "completion_tokens": 7, "total_tokens": 11},
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            _ = format, args
+
+    fixture.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    fixture.thread = threading.Thread(target=fixture.server.serve_forever, daemon=True)
+    fixture.thread.start()
+    try:
+        yield fixture
+    finally:
+        assert fixture.server is not None
+        fixture.server.shutdown()
+        if fixture.thread is not None:
+            fixture.thread.join(timeout=2)
+        fixture.server.server_close()
+
+
+@contextmanager
+def _http_method_fixture():
+    class Fixture:
+        def __init__(self) -> None:
+            self.get_count = 0
+            self.post_count = 0
+            self.server: ThreadingHTTPServer | None = None
+            self.thread: threading.Thread | None = None
+
+        @property
+        def url(self) -> str:
+            assert self.server is not None
+            return f"http://127.0.0.1:{self.server.server_port}/resource"
+
+    fixture = Fixture()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            fixture.get_count += 1
+            body = b"runtime-hardening-get"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:  # noqa: N802
+            fixture.post_count += 1
+            length = int(self.headers.get("Content-Length", "0"))
+            _ = self.rfile.read(length)
+            body = b"runtime-hardening-post"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            _ = format, args
+
+    fixture.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    fixture.thread = threading.Thread(target=fixture.server.serve_forever, daemon=True)
+    fixture.thread.start()
+    try:
+        yield fixture
+    finally:
+        assert fixture.server is not None
+        fixture.server.shutdown()
+        if fixture.thread is not None:
+            fixture.thread.join(timeout=2)
+        fixture.server.server_close()
 
 
 @contextmanager

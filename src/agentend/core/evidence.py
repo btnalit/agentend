@@ -14,6 +14,77 @@ from agentend.db.models import EvidenceLink, SourceRecord, ToolCall
 from agentend.tools.base import ToolContext, ToolResult
 
 
+def record_file_read_evidence(
+    session: Session,
+    home: Path,
+    *,
+    run_id: str,
+    path: Path,
+    text: str,
+) -> SourceRecord:
+    source = _add_source(
+        session,
+        home,
+        run_id=run_id,
+        source_type="file_read",
+        url=None,
+        path=str(path),
+        title=path.name,
+        quote=text[:500],
+        content_hash=_hash_payload({"path": str(path), "text": text}),
+    )
+    return source
+
+
+def record_browser_extract_evidence(
+    session: Session,
+    home: Path,
+    *,
+    run_id: str,
+    url: str,
+    title: str | None,
+    text: str,
+) -> SourceRecord:
+    source = _add_source(
+        session,
+        home,
+        run_id=run_id,
+        source_type="browser_extract",
+        url=url,
+        path=None,
+        title=title,
+        quote=text[:500],
+        content_hash=_hash_payload({"url": url, "title": title, "text": text}),
+    )
+    return source
+
+
+def record_browser_screenshot_evidence(
+    session: Session,
+    home: Path,
+    *,
+    run_id: str,
+    url: str,
+    title: str | None,
+    path: Path,
+    dom_excerpt: str,
+    content_hash: str,
+) -> SourceRecord:
+    source = _add_source(
+        session,
+        home,
+        run_id=run_id,
+        source_type="browser_screenshot",
+        url=url,
+        path=str(path),
+        title=title,
+        quote=dom_excerpt[:500],
+        content_hash=content_hash,
+        relation="captured_artifact",
+    )
+    return source
+
+
 def record_web_fetch_evidence(
     session: Session,
     home: Path,
@@ -29,6 +100,7 @@ def record_web_fetch_evidence(
         run_id=run_id,
         source_type="web",
         url=url,
+        path=None,
         title=title,
         quote=text[:500],
         content_hash=_hash_payload({"url": url, "title": title, "text": text}),
@@ -56,6 +128,7 @@ def record_web_search_evidence(
             run_id=run_id,
             source_type="web_search",
             url=url,
+            path=None,
             title=title,
             quote=snippet[:500],
             content_hash=_hash_payload(
@@ -106,6 +179,22 @@ def rehydrate_cached_evidence(session: Session, context: ToolContext, tool_name:
     return result
 
 
+def attach_artifact_to_sources(session: Session, *, run_id: str, payload: dict[str, Any], artifact_id: str) -> None:
+    for source_id in _source_ids(payload):
+        links = (
+            session.execute(
+                select(EvidenceLink)
+                .where(EvidenceLink.run_id == run_id)
+                .where(EvidenceLink.source_id == source_id)
+                .where(EvidenceLink.artifact_id.is_(None))
+            )
+            .scalars()
+            .all()
+        )
+        for link in links:
+            link.artifact_id = artifact_id
+
+
 def evidence_manifest_for_run(session: Session, home: Path, run_id: str) -> dict[str, Any]:
     sources = session.execute(select(SourceRecord).where(SourceRecord.used_by_run_id == run_id).order_by(SourceRecord.fetched_at)).scalars().all()
     links = session.execute(select(EvidenceLink).where(EvidenceLink.run_id == run_id).order_by(EvidenceLink.created_at)).scalars().all()
@@ -149,21 +238,25 @@ def _add_source(
     run_id: str,
     source_type: str,
     url: str | None,
+    path: str | None,
     title: str | None,
     quote: str,
     content_hash: str,
+    artifact_id: str | None = None,
+    relation: str = "used_by_tool",
 ) -> SourceRecord:
     source = SourceRecord(
         id=str(uuid4()),
         used_by_run_id=run_id,
         source_type=source_type,
         url=redact_text(home, url or ""),
+        path=redact_text(home, path or ""),
         title=redact_text(home, title or ""),
         content_hash=content_hash,
         quote=redact_text(home, quote),
     )
     session.add(source)
-    session.add(EvidenceLink(id=str(uuid4()), source_id=source.id, run_id=run_id, relation="used_by_tool"))
+    session.add(EvidenceLink(id=str(uuid4()), source_id=source.id, run_id=run_id, artifact_id=artifact_id, relation=relation))
     return source
 
 

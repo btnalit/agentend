@@ -531,7 +531,7 @@ agentend tools test tools.generate --input '{"goal":"parse CSV summary"}'
 
 目标：一键诊断本地运行环境和关键依赖。
 
-实施状态：`Done`。已实现 `doctor` 和 `doctor --json`，覆盖 Python、依赖、home、SQLite、LLM 和 local subprocess。
+实施状态：`Done`。已实现 `doctor` 和 `doctor --json`，覆盖 Python、依赖、home、SQLite、artifacts、sandboxes、LLM、search、Telegram token、MCP server 状态、Skill Market、Browser、Vision 和 local subprocess。
 
 范围：
 
@@ -780,7 +780,7 @@ agentend secrets check TELEGRAM_BOT_TOKEN
 
 目标：减少重复调用，并让 Replanner 基于结构化错误工作。
 
-实施状态：`Done`。已完成 Error Taxonomy、`error_records`、工具失败结构化记录和 Result Cache。ToolRegistry 统一缓存 `web.fetch`、`web.search`、`http.request`，按 normalized input + config hash 生成 cache key，记录 hit/miss/stale 事件。
+实施状态：`Done`。已完成 Error Taxonomy、`error_records`、工具失败结构化记录和 Result Cache。ToolRegistry 统一缓存 `web.fetch`、`web.search` 和网络读形态的 `http.request`，按 normalized input + config hash 生成 cache key，记录 hit/miss/stale 事件；POST/PUT/PATCH/DELETE 等 `network_write` 不进入缓存。
 
 范围：
 
@@ -1213,14 +1213,14 @@ agentend extensions show <extension_id>
 
 目标：为搜索、抓取、报告和审计建立来源证据链。
 
-实施状态：`Done`。已实现 `source_records`、`evidence_links` 表结构、`sources list/show`，`web.fetch` 已接入 source record。
+实施状态：`Done`。已实现 `source_records`、`evidence_links` 表结构、`sources list/show`；`web.fetch`、`web.search`、`fs.read_text`、`file.read_text`、`browser.extract` 和 `browser.screenshot` 已接入 source record，screenshot source 会关联 artifact。
 
 依赖：T14、T29、T34。
 
 范围：
 
 - `source_records`、`evidence_links` 表。
-- web.fetch、browser.extract、file.read source 记录。
+- web/search、browser extract/screenshot、file read source 记录。
 - run export 包含 evidence manifest。
 
 验收：
@@ -1300,7 +1300,7 @@ agentend runs replay <run_id>
 
 目标：把 Eval 从 smoke 基线扩展成持续回归反馈回路。
 
-实施状态：`Done`。已落地 `tools-smoke`、`skills-smoke`、失败 eval 自动 run export、human summary 和 machine-readable JSON report；所有 case 使用本地、fake 或 dry-run 输入，不依赖真实外部 API key。`skills-smoke` 同时支持默认 built-in skills、`--skill` 单 skill 和 `--skill-path` 本地 skill draft。
+实施状态：`Done`。已落地 `tools-smoke`、`skills-smoke`、`runtime-hardening`、失败 eval 自动 run export、human summary 和 machine-readable JSON report；所有 case 使用本地、fake 或 dry-run 输入，不依赖真实外部 API key。`skills-smoke` 同时支持默认 built-in skills、`--skill` 单 skill 和 `--skill-path` 本地 skill draft。
 
 优先级：后续增强第 2 位。T53 后立即增强 eval，可让后续真实 provider、skill market 和调度增强都有任务级回归。
 
@@ -1320,6 +1320,7 @@ agentend runs replay <run_id>
 agentend eval list
 agentend eval run tools-smoke
 agentend eval run skills-smoke
+agentend eval run runtime-hardening
 agentend eval run skills-smoke --skill-path ./data/skill_drafts/demo.promoted
 agentend eval report <eval_run_id>
 ```
@@ -1328,6 +1329,8 @@ agentend eval report <eval_run_id>
 
 - `tests/test_phase_k_eval_suite_expansion.py::test_tools_smoke_eval_covers_high_impact_tools_and_summary` 覆盖高影响工具 eval case 和 human summary。
 - `tests/test_phase_k_eval_suite_expansion.py::test_skills_smoke_eval_runs_builtin_skills` 覆盖默认 built-in skill eval。
+- `tests/test_phase_k_eval_suite_expansion.py::test_runtime_hardening_eval_covers_repaired_runtime_paths` 覆盖 LLM fixture、Telegram MCP、HTTP side effect、path boundary、Skill tool usage、model route 和 evidence。
+- `tests/test_phase_k_eval_suite_expansion.py::test_runtime_hardening_eval_exports_failed_case_run` 覆盖 runtime-hardening 失败 case 导出 run。
 - `tests/test_phase_k_eval_suite_expansion.py::test_failed_tools_smoke_eval_exports_failed_run` 覆盖失败 eval 输出 run export 路径。
 - `tests/test_phase_k_eval_suite_expansion.py::test_episode_skill_draft_eval_runs_after_validation` 覆盖 draft skill eval 在 `skills validate --path` 后运行。
 
@@ -1339,6 +1342,12 @@ python -m pytest tests\test_phase_i_eval_contract_snapshot.py tests\test_phase_d
 python -m pytest -q
 git diff --check
 ```
+
+保留风险：
+
+- `runtime-hardening` 使用本地 fixture 覆盖真实 provider 协议和关键调用链，不替代用户生产环境中的真实 API key、网络、限流和费用验收。
+- Browser/Playwright 的真实截图能力仍受本机浏览器安装和系统权限影响；eval 保证 fallback 可运行，真实浏览器状态由 `doctor` 暴露。
+- 后续新增 HTTP method、provider 或外部写入工具时，仍必须保留动态 side effect、Action Policy、Result Cache guard 和 evidence/export 回归。
 
 ### T55 真实 Search Provider + Evidence Export `HITL`
 

@@ -22,6 +22,7 @@ class LLMConfig:
     temperature: float
     max_tokens: int
     provider_config: LLMProviderConfig
+    providers: dict[str, LLMProviderConfig]
 
 
 @dataclass(frozen=True)
@@ -84,10 +85,19 @@ def load_config(home: Path) -> AppConfig:
     llm_section = raw.get("llm", {})
     provider = str(llm_section.get("provider", "openai"))
     providers = llm_section.get("providers", {})
-    provider_raw = providers.get(provider, {})
-    provider_config = LLMProviderConfig(
-        api_key_env=str(provider_raw.get("api_key_env", f"{provider.upper()}_API_KEY")),
-        base_url=str(provider_raw.get("base_url", "https://api.openai.com/v1")),
+    provider_configs = {
+        str(name): LLMProviderConfig(
+            api_key_env=str(provider_raw.get("api_key_env", f"{str(name).upper()}_API_KEY")),
+            base_url=str(provider_raw.get("base_url", "https://api.openai.com/v1")),
+        )
+        for name, provider_raw in providers.items()
+        if isinstance(provider_raw, dict)
+    }
+    provider_configs.setdefault("fake", LLMProviderConfig(api_key_env="", base_url=""))
+    provider_configs.setdefault("openai", LLMProviderConfig(api_key_env="OPENAI_API_KEY", base_url="https://api.openai.com/v1"))
+    provider_config = provider_configs.get(
+        provider,
+        LLMProviderConfig(api_key_env=f"{provider.upper()}_API_KEY", base_url="https://api.openai.com/v1"),
     )
     llm = LLMConfig(
         provider=provider,
@@ -95,6 +105,7 @@ def load_config(home: Path) -> AppConfig:
         temperature=float(llm_section.get("temperature", 0.2)),
         max_tokens=int(llm_section.get("max_tokens", 4096)),
         provider_config=provider_config,
+        providers=provider_configs,
     )
     data_section = raw.get("data", {})
     data = DataConfig(
@@ -160,22 +171,30 @@ def set_llm_config(home: Path, provider: str, model: str) -> AppConfig:
     config = load_config(home)
     config_path = config.home / "config.toml"
     provider_config = config.llm.provider_config
+    if provider == "fake":
+        next_provider_config = {"api_key_env": "", "base_url": ""}
+    elif provider == config.llm.provider:
+        next_provider_config = {
+            "api_key_env": provider_config.api_key_env,
+            "base_url": provider_config.base_url,
+        }
+    else:
+        next_provider_config = {
+            "api_key_env": f"{provider.upper()}_API_KEY",
+            "base_url": "https://api.openai.com/v1",
+        }
+    providers = {
+        name: {"api_key_env": item.api_key_env, "base_url": item.base_url}
+        for name, item in config.llm.providers.items()
+    }
+    providers[provider] = next_provider_config
     raw = {
         "llm": {
             "provider": provider,
             "model": model,
             "temperature": config.llm.temperature,
             "max_tokens": config.llm.max_tokens,
-            "providers": {
-                provider: {
-                    "api_key_env": provider_config.api_key_env
-                    if provider == config.llm.provider
-                    else f"{provider.upper()}_API_KEY",
-                    "base_url": provider_config.base_url
-                    if provider == config.llm.provider
-                    else "https://api.openai.com/v1",
-                }
-            },
+            "providers": providers,
         },
         "data": {
             "db_path": config.data.db_path,
@@ -211,7 +230,17 @@ def _dump_toml(raw: dict[str, Any]) -> str:
     llm = raw["llm"]
     data = raw["data"]
     provider = llm["provider"]
-    provider_config = llm["providers"][provider]
+    provider_configs = dict(llm.get("providers", {}))
+    llm_provider_lines: list[str] = []
+    for name, provider_config in provider_configs.items():
+        llm_provider_lines.extend(
+            [
+                f"[llm.providers.{name}]",
+                f'api_key_env = "{provider_config.get("api_key_env", "")}"',
+                f'base_url = "{provider_config.get("base_url", "")}"',
+                "",
+            ]
+        )
     search = raw.get("search", {"provider": "fake", "providers": {"fake": {"api_key_env": "", "base_url": ""}}})
     search_lines = ["[search]", f'provider = "{search.get("provider", "fake")}"', ""]
     for name, search_provider in dict(search.get("providers", {})).items():
@@ -241,9 +270,8 @@ def _dump_toml(raw: dict[str, Any]) -> str:
         f'model = "{llm["model"]}"\n'
         f"temperature = {llm['temperature']}\n"
         f"max_tokens = {llm['max_tokens']}\n\n"
-        f"[llm.providers.{provider}]\n"
-        f'api_key_env = "{provider_config["api_key_env"]}"\n'
-        f'base_url = "{provider_config["base_url"]}"\n\n'
+        + "\n".join(llm_provider_lines)
+        + "\n"
         "[telegram]\n"
         "enabled = false\n"
         'bot_token_env = "TELEGRAM_BOT_TOKEN"\n\n'

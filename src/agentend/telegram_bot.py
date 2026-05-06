@@ -12,7 +12,7 @@ from agentend.core.events import record_event
 from agentend.core.profile import load_agent_profile
 from agentend.core.secrets import redact_text
 from agentend.core.workflow_registry import WorkflowRegistry
-from agentend.core.workflow_runner import WorkflowRunner
+from agentend.core.workflow_runner import WorkflowRunFailed, WorkflowRunner
 from agentend.db.models import ClarificationRequest, Conversation, Run
 from agentend.db.session import init_database
 from agentend.db.session import session_scope
@@ -43,14 +43,19 @@ class TelegramMessageRouter:
                 return "Usage: /run <workflow_id> <input>"
             workflow_id = parts[1]
             input_text = parts[2] if len(parts) > 2 else ""
-            workflow = WorkflowRegistry(load_config(self.home)).get(workflow_id)
-            result = WorkflowRunner(self.home).run(
-                workflow,
-                input_text,
-                channel="telegram",
-                external_user_id=external_user_id,
-            )
-            return self._run_reply(result.run_id, result.output)
+            try:
+                workflow = WorkflowRegistry(load_config(self.home)).get(workflow_id)
+                result = WorkflowRunner(self.home).run(
+                    workflow,
+                    input_text,
+                    channel="telegram",
+                    external_user_id=external_user_id,
+                )
+                return self._run_reply(result.run_id, result.output)
+            except WorkflowRunFailed as exc:
+                return self._error_reply(exc.message, run_id=exc.run_id)
+            except Exception as exc:
+                return self._error_reply(str(exc))
         if stripped == "/status":
             with session_scope(self.home) as session:
                 run = (
@@ -75,13 +80,18 @@ class TelegramMessageRouter:
 
         pending_run_id = self._pending_telegram_run_id(external_user_id)
         if pending_run_id is not None:
-            result = WorkflowRunner(self.home).resume(
-                pending_run_id,
-                answer=text,
-                expected_channel="telegram",
-                expected_external_user_id=external_user_id,
-            )
-            return self._run_reply(result.run_id, result.output)
+            try:
+                result = WorkflowRunner(self.home).resume(
+                    pending_run_id,
+                    answer=text,
+                    expected_channel="telegram",
+                    expected_external_user_id=external_user_id,
+                )
+                return self._run_reply(result.run_id, result.output)
+            except WorkflowRunFailed as exc:
+                return self._error_reply(exc.message, run_id=exc.run_id)
+            except Exception as exc:
+                return self._error_reply(str(exc), run_id=pending_run_id)
 
         response = ConversationService(self.home).handle_message(
             channel="telegram",
@@ -137,6 +147,10 @@ class TelegramMessageRouter:
         else:
             safe_output = output
         return f"Run: {run_id}\n{self._safe_text(safe_output)}"
+
+    def _error_reply(self, message: str, *, run_id: str | None = None) -> str:
+        prefix = f"Run: {run_id}\n" if run_id else ""
+        return f"{prefix}Error: {self._safe_text(message)}"
 
     def _safe_text(self, text: str) -> str:
         redacted = redact_text(self.home, text)

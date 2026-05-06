@@ -131,6 +131,93 @@ def test_schedule_tick_preserves_scheduler_run_mode_for_blocked_external_write(t
         assert schedule.last_triggered_at is not None
 
 
+def test_scheduler_blocks_local_execute_tools_by_default(tmp_path: Path) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+    (home / "workflows" / "definitions" / "scheduled_shell.yaml").write_text(
+        """id: scheduled_shell
+name: Scheduled Shell
+nodes:
+  - id: shell
+    type: tool
+    tool: shell.run
+    input:
+      command: "python --version"
+  - id: final
+    type: final
+    depends_on: [shell]
+""",
+        encoding="utf-8",
+    )
+    added = runner.invoke(
+        app,
+        [
+            "schedule",
+            "add",
+            "--home",
+            str(home),
+            "--workflow",
+            "scheduled_shell",
+            "--cron",
+            "* * * * *",
+        ],
+    )
+    assert added.exit_code == 0
+    with session_scope(home) as session:
+        schedule = session.execute(select(Schedule)).scalar_one()
+
+    result = runner.invoke(app, ["schedule", "run-now", schedule.id, "--home", str(home)])
+
+    assert result.exit_code == 1
+    assert "local_execute is blocked during scheduler" in result.output
+
+
+def test_scheduler_blocks_http_post_as_network_write_before_request(tmp_path: Path) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+    (home / "workflows" / "definitions" / "scheduled_http_post.yaml").write_text(
+        """id: scheduled_http_post
+name: Scheduled HTTP Post
+nodes:
+  - id: post
+    type: tool
+    tool: http.request
+    input:
+      url: "http://127.0.0.1:1"
+      method: "POST"
+      json:
+        ok: true
+  - id: final
+    type: final
+    depends_on: [post]
+""",
+        encoding="utf-8",
+    )
+    added = runner.invoke(
+        app,
+        [
+            "schedule",
+            "add",
+            "--home",
+            str(home),
+            "--workflow",
+            "scheduled_http_post",
+            "--cron",
+            "* * * * *",
+        ],
+    )
+    assert added.exit_code == 0
+    with session_scope(home) as session:
+        schedule = session.execute(select(Schedule)).scalar_one()
+
+    result = runner.invoke(app, ["schedule", "run-now", schedule.id, "--home", str(home)])
+
+    assert result.exit_code == 1
+    assert "network_write is blocked during scheduler" in result.output
+
+
 def _write_external_write_workflow(home: Path) -> None:
     (home / "workflows" / "definitions" / "scheduled_send.yaml").write_text(
         """id: scheduled_send

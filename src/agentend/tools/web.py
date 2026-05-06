@@ -29,9 +29,15 @@ class WebFetchTool:
 
     def call(self, input_data: dict, context: ToolContext) -> ToolResult:
         url = str(input_data["url"])
-        response = httpx.get(url, timeout=int(input_data.get("timeout_seconds", 20)))
-        response.raise_for_status()
-        title, text = _html_text(response.text)
+        if url.startswith("https://example.com/search/"):
+            title = "Fake search result"
+            text = f"Offline fixture content for {url}."
+            status_code = 200
+        else:
+            response = httpx.get(url, timeout=int(input_data.get("timeout_seconds", 20)))
+            response.raise_for_status()
+            title, text = _html_text(response.text)
+            status_code = response.status_code
         source = record_web_fetch_evidence(
             context.session,
             context.home,
@@ -40,7 +46,7 @@ class WebFetchTool:
             title=title,
             text=text,
         )
-        data = {"url": url, "title": title, "text": text, "status_code": response.status_code, "source_id": source.id}
+        data = {"url": url, "title": title, "text": text, "status_code": status_code, "source_id": source.id}
         return ToolResult(content=text, data=data)
 
 

@@ -4,12 +4,13 @@ import json
 import shutil
 from pathlib import Path
 
+from agentend.core.evidence import record_file_read_evidence
+from agentend.core.paths import ensure_not_root, resolve_home_child
 from agentend.tools.base import ToolContext, ToolResult
 
 
 def _resolve(home: Path, value: object) -> Path:
-    path = Path(str(value))
-    return path if path.is_absolute() else (home / path).resolve()
+    return resolve_home_child(home, value)
 
 
 class FsListTool:
@@ -29,6 +30,11 @@ class FsGlobTool:
     input_schema = {"type": "object", "required": ["pattern"]}
 
     def call(self, input_data: dict, context: ToolContext) -> ToolResult:
+        pattern = Path(str(input_data["pattern"]))
+        if pattern.is_absolute():
+            raise ValueError("pattern must be relative to AgentEnd home")
+        if ".." in pattern.parts:
+            raise ValueError("pattern must not contain '..'")
         matches = sorted(str(path.relative_to(context.home)) for path in context.home.glob(str(input_data["pattern"])))
         return ToolResult(content="\n".join(matches), data={"matches": matches})
 
@@ -53,7 +59,8 @@ class FsReadTextTool:
     def call(self, input_data: dict, context: ToolContext) -> ToolResult:
         path = _resolve(context.home, input_data["path"])
         content = path.read_text(encoding="utf-8")
-        return ToolResult(content=content, data={"path": str(path)})
+        source = record_file_read_evidence(context.session, context.home, run_id=context.run_id, path=path, text=content)
+        return ToolResult(content=content, data={"path": str(path), "source_id": source.id})
 
 
 class FsWriteTextTool:
@@ -102,6 +109,7 @@ class FsDeleteTool:
 
     def call(self, input_data: dict, context: ToolContext) -> ToolResult:
         path = _resolve(context.home, input_data["path"])
+        ensure_not_root(path, context.home)
         if path.is_dir():
             if not bool(input_data.get("recursive", False)):
                 raise ValueError("recursive=true is required to delete a directory")
