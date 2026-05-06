@@ -16,6 +16,35 @@ base_url = "https://api.openai.com/v1"
 enabled = false
 bot_token_env = "TELEGRAM_BOT_TOKEN"
 
+[search]
+provider = "fake"
+
+[search.providers.fake]
+api_key_env = ""
+base_url = ""
+
+[search.providers.brave]
+api_key_env = "BRAVE_SEARCH_API_KEY"
+base_url = "https://api.search.brave.com/res/v1/web/search"
+
+[vision]
+provider = "fake"
+
+[vision.providers.fake]
+api_key_env = ""
+base_url = ""
+model = "fake-vision"
+
+[vision.providers.openai]
+api_key_env = "OPENAI_API_KEY"
+base_url = "https://api.openai.com/v1"
+model = "gpt-4.1"
+
+[vision.providers.gemini]
+api_key_env = "GEMINI_API_KEY"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+model = "gemini-2.5-flash"
+
 [data]
 db_path = "./data/agentend.sqlite"
 artifact_dir = "./data/artifacts"
@@ -27,6 +56,8 @@ workflow_dir = "./workflows/definitions"
 
 DEFAULT_ENV_EXAMPLE = """OPENAI_API_KEY=
 TELEGRAM_BOT_TOKEN=
+BRAVE_SEARCH_API_KEY=
+GEMINI_API_KEY=
 """
 
 
@@ -84,6 +115,10 @@ def initialize_home(home: Path, force: bool = False) -> InitResult:
     _write_template(resolved / ".env.example", DEFAULT_ENV_EXAMPLE, force=force)
     _write_template(resolved / "agent.md", DEFAULT_AGENT_PROFILE, force=force)
     _write_template(workflow_dir / "simple_chat.yaml", DEFAULT_WORKFLOW, force=force)
+
+    from agentend.db.session import init_database
+
+    init_database(resolved)
 
     return InitResult(home=resolved)
 

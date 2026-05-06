@@ -15,12 +15,14 @@ class WorkflowNode(BaseModel):
     tool: str | None = None
     workflow: str | None = None
     input: dict[str, Any] = Field(default_factory=dict)
+    context: dict[str, Any] = Field(default_factory=dict)
 
 
 class WorkflowDefinition(BaseModel):
     id: str
     name: str
     description: str | None = None
+    context: dict[str, Any] = Field(default_factory=dict)
     nodes: list[WorkflowNode]
 
     @model_validator(mode="after")

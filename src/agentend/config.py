@@ -34,10 +34,37 @@ class DataConfig:
 
 
 @dataclass(frozen=True)
+class SearchProviderConfig:
+    api_key_env: str
+    base_url: str
+
+
+@dataclass(frozen=True)
+class SearchConfig:
+    provider: str
+    providers: dict[str, SearchProviderConfig]
+
+
+@dataclass(frozen=True)
+class VisionProviderConfig:
+    api_key_env: str
+    base_url: str
+    model: str
+
+
+@dataclass(frozen=True)
+class VisionConfig:
+    provider: str
+    providers: dict[str, VisionProviderConfig]
+
+
+@dataclass(frozen=True)
 class AppConfig:
     home: Path
     llm: LLMConfig
     data: DataConfig
+    search: SearchConfig
+    vision: VisionConfig
 
     def resolve_home_path(self, value: str) -> Path:
         path = Path(value)
@@ -77,8 +104,56 @@ def load_config(home: Path) -> AppConfig:
         agent_profile_path=str(data_section.get("agent_profile_path", "./agent.md")),
         workflow_dir=str(data_section.get("workflow_dir", "./workflows/definitions")),
     )
+    search_section = raw.get("search", {})
+    search_providers_raw = search_section.get("providers", {})
+    search_providers = {
+        str(name): SearchProviderConfig(
+            api_key_env=str(provider_raw.get("api_key_env", "")),
+            base_url=str(provider_raw.get("base_url", "")),
+        )
+        for name, provider_raw in search_providers_raw.items()
+        if isinstance(provider_raw, dict)
+    }
+    search_providers.setdefault("fake", SearchProviderConfig(api_key_env="", base_url=""))
+    search_providers.setdefault(
+        "brave",
+        SearchProviderConfig(
+            api_key_env="BRAVE_SEARCH_API_KEY",
+            base_url="https://api.search.brave.com/res/v1/web/search",
+        ),
+    )
+    search = SearchConfig(provider=str(search_section.get("provider", "fake")), providers=search_providers)
+    vision_section = raw.get("vision", {})
+    vision_providers_raw = vision_section.get("providers", {})
+    vision_providers = {
+        str(name): VisionProviderConfig(
+            api_key_env=str(provider_raw.get("api_key_env", "")),
+            base_url=str(provider_raw.get("base_url", "")),
+            model=str(provider_raw.get("model", "")),
+        )
+        for name, provider_raw in vision_providers_raw.items()
+        if isinstance(provider_raw, dict)
+    }
+    vision_providers.setdefault("fake", VisionProviderConfig(api_key_env="", base_url="", model="fake-vision"))
+    vision_providers.setdefault(
+        "openai",
+        VisionProviderConfig(
+            api_key_env="OPENAI_API_KEY",
+            base_url="https://api.openai.com/v1",
+            model="gpt-4.1",
+        ),
+    )
+    vision_providers.setdefault(
+        "gemini",
+        VisionProviderConfig(
+            api_key_env="GEMINI_API_KEY",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            model="gemini-2.5-flash",
+        ),
+    )
+    vision = VisionConfig(provider=str(vision_section.get("provider", "fake")), providers=vision_providers)
     _load_env_file(resolved_home / ".env")
-    return AppConfig(home=resolved_home, llm=llm, data=data)
+    return AppConfig(home=resolved_home, llm=llm, data=data, search=search, vision=vision)
 
 
 def set_llm_config(home: Path, provider: str, model: str) -> AppConfig:
@@ -109,6 +184,24 @@ def set_llm_config(home: Path, provider: str, model: str) -> AppConfig:
             "agent_profile_path": config.data.agent_profile_path,
             "workflow_dir": config.data.workflow_dir,
         },
+        "search": {
+            "provider": config.search.provider,
+            "providers": {
+                name: {"api_key_env": provider.api_key_env, "base_url": provider.base_url}
+                for name, provider in config.search.providers.items()
+            },
+        },
+        "vision": {
+            "provider": config.vision.provider,
+            "providers": {
+                name: {
+                    "api_key_env": provider.api_key_env,
+                    "base_url": provider.base_url,
+                    "model": provider.model,
+                }
+                for name, provider in config.vision.providers.items()
+            },
+        },
     }
     config_path.write_text(_dump_toml(raw), encoding="utf-8")
     return load_config(home)
@@ -119,6 +212,29 @@ def _dump_toml(raw: dict[str, Any]) -> str:
     data = raw["data"]
     provider = llm["provider"]
     provider_config = llm["providers"][provider]
+    search = raw.get("search", {"provider": "fake", "providers": {"fake": {"api_key_env": "", "base_url": ""}}})
+    search_lines = ["[search]", f'provider = "{search.get("provider", "fake")}"', ""]
+    for name, search_provider in dict(search.get("providers", {})).items():
+        search_lines.extend(
+            [
+                f"[search.providers.{name}]",
+                f'api_key_env = "{search_provider.get("api_key_env", "")}"',
+                f'base_url = "{search_provider.get("base_url", "")}"',
+                "",
+            ]
+        )
+    vision = raw.get("vision", {"provider": "fake", "providers": {"fake": {"api_key_env": "", "base_url": "", "model": "fake-vision"}}})
+    vision_lines = ["[vision]", f'provider = "{vision.get("provider", "fake")}"', ""]
+    for name, vision_provider in dict(vision.get("providers", {})).items():
+        vision_lines.extend(
+            [
+                f"[vision.providers.{name}]",
+                f'api_key_env = "{vision_provider.get("api_key_env", "")}"',
+                f'base_url = "{vision_provider.get("base_url", "")}"',
+                f'model = "{vision_provider.get("model", "")}"',
+                "",
+            ]
+        )
     return (
         "[llm]\n"
         f'provider = "{provider}"\n'
@@ -131,6 +247,10 @@ def _dump_toml(raw: dict[str, Any]) -> str:
         "[telegram]\n"
         "enabled = false\n"
         'bot_token_env = "TELEGRAM_BOT_TOKEN"\n\n'
+        + "\n".join(search_lines)
+        + "\n"
+        + "\n".join(vision_lines)
+        + "\n"
         "[data]\n"
         f'db_path = "{data["db_path"]}"\n'
         f'artifact_dir = "{data["artifact_dir"]}"\n'

@@ -7,7 +7,10 @@ from sqlalchemy import select
 
 from agentend.config import load_config
 from agentend.core.events import record_event
+from agentend.core.goal_analyzer import analyze_goal
 from agentend.core.profile import load_agent_profile
+from agentend.core.tool_contracts import sync_tool_manifests
+from agentend.core.tool_registry import ToolRegistry
 from agentend.db.models import Conversation, Message, Run
 from agentend.db.session import init_database, session_scope
 
@@ -56,6 +59,8 @@ class ConversationService:
             )
             session.add(user_message)
             record_event(session, "message.received", {"conversation_id": conversation.id})
+            sync_tool_manifests(session, ToolRegistry(self.home).manifests())
+            goal_analysis = analyze_goal(self.home, session, text)
 
             run = Run(
                 id=str(uuid4()),
@@ -63,7 +68,7 @@ class ConversationService:
                 workflow_id=None,
                 status="completed",
                 input_json=json.dumps({"message": text}, ensure_ascii=False),
-                result_json=json.dumps({"content": f"Echo: {text}"}, ensure_ascii=False),
+                result_json=json.dumps({"content": f"Echo: {text}", "goal_analysis": goal_analysis}, ensure_ascii=False),
                 agent_profile_path=str(profile.path),
                 agent_profile_hash=profile.digest,
                 llm_provider=config.llm.provider,

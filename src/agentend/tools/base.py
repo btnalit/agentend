@@ -11,6 +11,7 @@ class ToolContext:
     run_id: str
     step_id: str | None
     session: Session
+    run_mode: str = "normal"
 
 
 @dataclass(frozen=True)
