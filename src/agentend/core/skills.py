@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import yaml
 from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from agentend.core.workflow_schema import WorkflowDefinition, load_workflow_yaml
@@ -144,12 +145,18 @@ def upsert_skill(
     extension_content_hash: str | None = None,
     extension_version_source: str | None = None,
 ) -> Skill:
+    values = _skill_bundle_values(bundle)
+    update_values = {key: value for key, value in values.items() if key not in {"id", "enabled"}}
+    session.execute(
+        sqlite_insert(Skill)
+        .values(**values)
+        .on_conflict_do_update(index_elements=["id"], set_=update_values)
+    )
     row = session.get(Skill, bundle.id)
-    created = row is None
     if row is None:
-        row = Skill(id=bundle.id)
-        session.add(row)
-    _apply_skill_bundle(row, bundle, created=created)
+        session.flush()
+        row = session.get(Skill, bundle.id)
+    assert row is not None
     upsert_extension(
         session,
         kind="skill",
@@ -161,6 +168,24 @@ def upsert_skill(
         version_source=extension_version_source,
     )
     return row
+
+
+def _skill_bundle_values(bundle: SkillBundle) -> dict[str, str]:
+    return {
+        "id": bundle.id,
+        "version": bundle.version,
+        "description": bundle.description,
+        "triggers_json": json.dumps(bundle.triggers, ensure_ascii=False),
+        "workflow_path": str(bundle.workflow_path),
+        "required_tools_json": json.dumps(bundle.required_tools, ensure_ascii=False),
+        "required_mcp_json": json.dumps(bundle.required_mcp, ensure_ascii=False),
+        "input_schema_json": json.dumps(bundle.input_schema, ensure_ascii=False),
+        "output_schema_json": json.dumps(bundle.output_schema, ensure_ascii=False),
+        "enabled": "true" if bundle.enabled else "false",
+        "source_type": bundle.source_type,
+        "source_location": bundle.source_location,
+        "manifest_json": json.dumps(bundle.manifest, ensure_ascii=False, sort_keys=True),
+    }
 
 
 def _apply_skill_bundle(row: Skill, bundle: SkillBundle, *, created: bool) -> None:
@@ -192,15 +217,29 @@ def upsert_extension(
 ) -> ExtensionRecord:
     extension_id = f"{kind}:{name}"
     digest = content_hash or sha256(f"{kind}:{name}:{source}:{version}".encode("utf-8")).hexdigest()
+    values = {
+        "id": extension_id,
+        "kind": kind,
+        "name": name,
+        "status": status,
+        "source": source,
+        "version": version,
+        "content_hash": digest,
+        "last_validated_at": utc_now(),
+    }
+    session.execute(
+        sqlite_insert(ExtensionRecord)
+        .values(**values)
+        .on_conflict_do_update(
+            index_elements=["id"],
+            set_={key: value for key, value in values.items() if key != "id"},
+        )
+    )
     row = session.get(ExtensionRecord, extension_id)
     if row is None:
-        row = ExtensionRecord(id=extension_id, kind=kind, name=name)
-        session.add(row)
-    row.status = status
-    row.source = source
-    row.version = version
-    row.content_hash = digest
-    row.last_validated_at = utc_now()
+        session.flush()
+        row = session.get(ExtensionRecord, extension_id)
+    assert row is not None
     if not (
         session.execute(
             select(ExtensionVersion)

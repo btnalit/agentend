@@ -1,8 +1,10 @@
+import os
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, event
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -16,23 +18,96 @@ def database_path(home: Path) -> Path:
 def create_sqlite_engine(home: Path) -> Engine:
     path = database_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
-    return create_engine(f"sqlite:///{path}", future=True)
+    engine = create_engine(f"sqlite:///{path}", connect_args={"timeout": 30}, future=True)
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:  # type: ignore[no-untyped-def]
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+
+    return engine
 
 
 def init_database(home: Path) -> Path:
-    engine = create_sqlite_engine(home)
-    Base.metadata.create_all(engine)
-    _ensure_incremental_columns(engine)
+    resolved_home = home.expanduser().resolve()
+    resolved_home.mkdir(parents=True, exist_ok=True)
+    with _init_file_lock(resolved_home):
+        engine = create_sqlite_engine(resolved_home)
+        _with_sqlite_retry(lambda: Base.metadata.create_all(engine))
+        _with_sqlite_retry(lambda: _ensure_incremental_columns(engine))
     return database_path(home)
+
+
+@contextmanager
+def _init_file_lock(home: Path, *, timeout_seconds: float = 30.0, stale_seconds: float = 120.0) -> Iterator[None]:
+    lock_path = home / ".agentend-init.lock"
+    deadline = time.monotonic() + timeout_seconds
+    fd: int | None = None
+    while fd is None:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"pid={os.getpid()} created_at={time.time()}\n".encode("utf-8"))
+        except FileExistsError:
+            if _lock_is_stale(lock_path, stale_seconds):
+                try:
+                    lock_path.unlink()
+                    continue
+                except OSError:
+                    pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out waiting for AgentEnd init lock: {lock_path}")
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _lock_is_stale(lock_path: Path, stale_seconds: float) -> bool:
+    try:
+        age = time.time() - lock_path.stat().st_mtime
+    except FileNotFoundError:
+        return False
+    return age > stale_seconds
+
+
+def _with_sqlite_retry(operation):
+    delay = 0.05
+    last_error: Exception | None = None
+    for _ in range(6):
+        try:
+            return operation()
+        except Exception as exc:
+            message = str(exc).lower()
+            if "database is locked" not in message and "database table is locked" not in message:
+                raise
+            last_error = exc
+            time.sleep(delay)
+            delay = min(delay * 2, 1.0)
+    if last_error is not None:
+        raise last_error
 
 
 def _ensure_incremental_columns(engine: Engine) -> None:
     additions = {
         "tasks": {
+            "agent_run_id": "VARCHAR(36)",
             "source_hash": "VARCHAR(64)",
             "batch_id": "VARCHAR(36)",
             "run_mode": "VARCHAR(32) NOT NULL DEFAULT 'normal'",
             "retry_after_at": "DATETIME",
+            "heartbeat_at": "DATETIME",
+            "progress_artifact_id": "VARCHAR(36)",
+            "claimed_at": "DATETIME",
+            "worker_id": "VARCHAR(64)",
+            "resume_cursor_json": "TEXT NOT NULL DEFAULT '{}'",
         },
         "schedules": {
             "consecutive_failures": "INTEGER NOT NULL DEFAULT 0",

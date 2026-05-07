@@ -16,7 +16,7 @@ from agentend.db.models import MemoryItem, MemoryRetrieval, utc_now
 
 
 LONG_TERM_SCOPES = {"project", "user"}
-TRUSTED_SOURCES = {"manual"}
+TRUSTED_SOURCES = {"manual", "agent_consolidator"}
 UNTRUSTED_ALLOWED_SCOPES = {"session", "task", "episode"}
 
 

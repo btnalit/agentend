@@ -25,6 +25,53 @@ class Conversation(Base):
     runs: Mapped[list["Run"]] = relationship(back_populates="conversation")
 
 
+class AgentRun(Base):
+    __tablename__ = "agent_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    conversation_id: Mapped[str | None] = mapped_column(ForeignKey("conversations.id"), nullable=True, index=True)
+    channel: Mapped[str] = mapped_column(String(32), default="cli", nullable=False, index=True)
+    external_user_id: Mapped[str] = mapped_column(String(128), default="local", nullable=False, index=True)
+    goal: Mapped[str] = mapped_column(Text, nullable=False)
+    goal_package_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
+    final_result_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    stop_reason: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    max_iterations: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    max_runtime_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+        nullable=False,
+    )
+
+
+class AgentIteration(Base):
+    __tablename__ = "agent_iterations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    agent_run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id"), nullable=False, index=True)
+    iteration_index: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="running", nullable=False, index=True)
+    plan_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    selected_action_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    observation_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    evaluation_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    linked_run_id: Mapped[str | None] = mapped_column(ForeignKey("runs.id"), nullable=True, index=True)
+    linked_tool_call_id: Mapped[str | None] = mapped_column(ForeignKey("tool_calls.id"), nullable=True, index=True)
+    checkpoint_id: Mapped[str | None] = mapped_column(ForeignKey("checkpoints.id"), nullable=True, index=True)
+    progress_artifact_id: Mapped[str | None] = mapped_column(ForeignKey("artifacts.id"), nullable=True, index=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class Message(Base):
     __tablename__ = "messages"
 
@@ -340,6 +387,42 @@ class MemoryRetrieval(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
+class MemoryCandidate(Base):
+    __tablename__ = "memory_candidates"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    agent_run_id: Mapped[str | None] = mapped_column(ForeignKey("agent_runs.id"), nullable=True, index=True)
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("runs.id"), nullable=True, index=True)
+    memory_id: Mapped[str | None] = mapped_column(ForeignKey("memory_items.id"), nullable=True, index=True)
+    type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    scope: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    merge_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    confidence: Mapped[str] = mapped_column(String(16), default="0.5", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
+    decision_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tags_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    evidence_artifact_id: Mapped[str | None] = mapped_column(ForeignKey("artifacts.id"), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+        nullable=False,
+    )
+
+
+class MemoryLink(Base):
+    __tablename__ = "memory_links"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    memory_id: Mapped[str] = mapped_column(ForeignKey("memory_items.id"), nullable=False, index=True)
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    relation: Mapped[str] = mapped_column(String(64), default="derived_from", nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class Checkpoint(Base):
     __tablename__ = "checkpoints"
 
@@ -444,6 +527,42 @@ class Capability(Base):
     risk_level: Mapped[str] = mapped_column(String(32), default="low", nullable=False)
     example_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class CapabilityEffectiveness(Base):
+    __tablename__ = "capability_effectiveness"
+
+    id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    capability_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    capability_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    goal_type: Mapped[str] = mapped_column(String(64), default="general", nullable=False, index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    successes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    failures: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    blocked: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    avg_duration_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    avg_iterations: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    common_error_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class CapabilityEffectivenessEvent(Base):
+    __tablename__ = "capability_effectiveness_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    agent_run_id: Mapped[str | None] = mapped_column(ForeignKey("agent_runs.id"), nullable=True, index=True)
+    iteration_id: Mapped[str | None] = mapped_column(ForeignKey("agent_iterations.id"), nullable=True, index=True)
+    capability_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    capability_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    goal_type: Mapped[str] = mapped_column(String(64), default="general", nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    output_artifact_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    iteration_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
 class SourceRecord(Base):
@@ -562,6 +681,7 @@ class TaskItem(Base):
     input_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
     run_id: Mapped[str | None] = mapped_column(ForeignKey("runs.id"), nullable=True, index=True)
+    agent_run_id: Mapped[str | None] = mapped_column(ForeignKey("agent_runs.id"), nullable=True, index=True)
     schedule_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     source: Mapped[str] = mapped_column(String(64), default="manual", nullable=False, index=True)
     source_path: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -569,6 +689,11 @@ class TaskItem(Base):
     batch_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     run_mode: Mapped[str] = mapped_column(String(32), default="normal", nullable=False, index=True)
     retry_after_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    progress_artifact_id: Mapped[str | None] = mapped_column(ForeignKey("artifacts.id"), nullable=True, index=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    resume_cursor_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)

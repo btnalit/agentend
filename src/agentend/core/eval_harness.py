@@ -18,19 +18,27 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from agentend.config import load_config
+from agentend.core.agent_run import AgentRunController
+from agentend.core.agent_selector import select_next_action
 from agentend.core.evidence import evidence_manifest_for_run
 from agentend.core.errors import classify_exception
+from agentend.core.effectiveness import effectiveness_for, record_effectiveness_event
 from agentend.core.llm_router import LLMRouter
+from agentend.core.memory_consolidator import consolidate_memory_candidates
 from agentend.core.memory_store import write_memory_item
 from agentend.core.model_routing import set_route
 from agentend.core.skills import ensure_builtin_skills, load_skill_bundle
+from agentend.core.tasks import TaskManager
 from agentend.core.tool_contracts import snapshot_to_dict
 from agentend.core.tool_registry import ToolRegistry
+from agentend.core.worker import AgentWorker
 from agentend.core.workflow_runner import WorkflowRunFailed
 from agentend.core.workflow_runner import WorkflowRunner
 from agentend.core.workflow_schema import load_workflow_yaml
 from agentend.db.models import (
     ActionPolicyDecision,
+    AgentIteration,
+    AgentRun,
     Artifact,
     Conversation,
     ContextLedger,
@@ -41,6 +49,8 @@ from agentend.db.models import (
     CostUsage,
     EvalRun,
     EvidenceLink,
+    MemoryCandidate,
+    MemoryItem,
     MemoryRetrieval,
     ResultCache,
     Run,
@@ -48,6 +58,7 @@ from agentend.db.models import (
     RunStep,
     Skill,
     SourceRecord,
+    TaskItem,
     ToolCall,
     ToolContractSnapshot,
 )
@@ -60,7 +71,20 @@ from agentend.tools.base import ToolContext
 CONTEXT_SMOKE_INPUT = "agentend context smoke anchor"
 CONTEXT_SMOKE_MEMORY = "agentend context smoke anchor project memory"
 CONTEXT_SMOKE_WORKFLOW = "context_smoke_eval"
-EVAL_SUITES = ("smoke", "context-smoke", "context-long", "tools-smoke", "skills-smoke", "runtime-hardening")
+EVAL_SUITES = (
+    "smoke",
+    "context-smoke",
+    "context-long",
+    "tools-smoke",
+    "skills-smoke",
+    "runtime-hardening",
+    "orchestration-smoke",
+    "tool-first",
+    "memory-consolidation",
+    "skill-effectiveness",
+    "long-task-worker",
+    "agent-replan",
+)
 PNG_1X1 = bytes.fromhex(
     "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
     "0000000c4944415408d7636060600000000400010d0a2db40000000049454e44ae426082"
@@ -99,6 +123,18 @@ def run_eval_suite(
         payload = _run_skills_smoke_suite(home, skill=skill, skill_path=skill_path)
     elif suite == "runtime-hardening":
         payload = _run_runtime_hardening_suite(home)
+    elif suite == "orchestration-smoke":
+        payload = _run_orchestration_smoke_suite(home)
+    elif suite == "tool-first":
+        payload = _run_tool_first_suite(home)
+    elif suite == "memory-consolidation":
+        payload = _run_memory_consolidation_suite(home)
+    elif suite == "skill-effectiveness":
+        payload = _run_skill_effectiveness_suite(home)
+    elif suite == "long-task-worker":
+        payload = _run_long_task_worker_suite(home)
+    elif suite == "agent-replan":
+        payload = _run_agent_replan_suite(home)
     else:
         raise ValueError(f"Unknown eval suite: {suite}")
 
@@ -110,6 +146,200 @@ def run_eval_suite(
     )
     session.add(row)
     return EvalResult(id=row.id, suite=suite, status=row.status, result=payload)
+
+
+def _run_orchestration_smoke_suite(home: Path) -> dict[str, object]:
+    result = AgentRunController(home).run(
+        "List the current project test command and explain the evidence.",
+        channel="eval",
+        external_user_id="orchestration-smoke",
+        max_iterations=2,
+    )
+    with session_scope(home) as session:
+        agent_run = session.get(AgentRun, result.agent_run_id)
+        iterations = (
+            session.execute(
+                select(AgentIteration)
+                .where(AgentIteration.agent_run_id == result.agent_run_id)
+                .order_by(AgentIteration.iteration_index)
+            )
+            .scalars()
+            .all()
+        )
+        first = iterations[0] if iterations else None
+        action = _json_or_empty(first.selected_action_json if first else "")
+        final_result = _json_or_empty(agent_run.final_result_json if agent_run else "")
+        cases = [
+            _case(
+                "agent-loop-completes",
+                {
+                    "agent_run_id": result.agent_run_id,
+                    "run_id": result.linked_run_id or "",
+                    "iteration_id": first.id if first else "",
+                    "selected_action": action,
+                },
+                [
+                    _assertion("agent run is completed", agent_run is not None and agent_run.status == "completed"),
+                    _assertion("iteration is recorded", first is not None),
+                    _assertion("tool-first action is selected", action.get("type") in {"skill_run", "tool_call", "workflow_run"}),
+                    _assertion("progress artifact is recorded", bool(final_result.get("progress_artifact_id"))),
+                ],
+            )
+        ]
+    return _suite_payload("orchestration-smoke", cases)
+
+
+def _run_tool_first_suite(home: Path) -> dict[str, object]:
+    with session_scope(home) as session:
+        selected = select_next_action(
+            home,
+            session,
+            "Read README and list pytest commands.",
+            {"candidate_skills": ["file.workspace_ops", "code.local_task"], "candidate_tools": ["fs.read_text", "shell.run"]},
+            [],
+        )
+        cases = [
+            _case(
+                "selector-prefers-action",
+                {"selected_action": selected.to_dict()},
+                [
+                    _assertion("selector avoids pure reasoning", selected.type in {"skill_run", "tool_call"}),
+                    _assertion("no_tool_reason is empty", not selected.no_tool_reason),
+                ],
+            )
+        ]
+    return _suite_payload("tool-first", cases)
+
+
+def _run_memory_consolidation_suite(home: Path) -> dict[str, object]:
+    result = AgentRunController(home).run(
+        "List project test command for memory consolidation.",
+        channel="eval",
+        external_user_id="memory-consolidation",
+        max_iterations=2,
+    )
+    with session_scope(home) as session:
+        consolidation = consolidate_memory_candidates(session, agent_run_id=result.agent_run_id)
+        candidates = (
+            session.execute(select(MemoryCandidate).where(MemoryCandidate.agent_run_id == result.agent_run_id))
+            .scalars()
+            .all()
+        )
+        memories = session.execute(select(MemoryItem).where(MemoryItem.source == "agent_consolidator")).scalars().all()
+        cases = [
+            _case(
+                "candidate-and-memory-created",
+                {
+                    "agent_run_id": result.agent_run_id,
+                    "memory_ids": consolidation.memory_ids,
+                    "candidate_count": len(candidates),
+                },
+                [
+                    _assertion("candidate is extracted", bool(candidates)),
+                    _assertion("memory item exists", bool(memories)),
+                    _assertion("consolidation is idempotent", consolidation.created_count == 0 and consolidation.skipped_count >= 1),
+                ],
+            )
+        ]
+    return _suite_payload("memory-consolidation", cases)
+
+
+def _run_skill_effectiveness_suite(home: Path) -> dict[str, object]:
+    with session_scope(home) as session:
+        record_effectiveness_event(
+            session,
+            capability_type="skill",
+            capability_id="code.local_task",
+            goal_type="code",
+            status="success",
+        )
+        record_effectiveness_event(
+            session,
+            capability_type="skill",
+            capability_id="file.workspace_ops",
+            goal_type="code",
+            status="failure",
+            error_code="eval_failure",
+        )
+        selected = select_next_action(
+            home,
+            session,
+            "Read project code and identify pytest command.",
+            {"candidate_skills": ["file.workspace_ops", "code.local_task"]},
+            [],
+        )
+        row = effectiveness_for(session, "skill", "code.local_task", "code")
+        cases = [
+            _case(
+                "effectiveness-influences-skill",
+                {"selected_action": selected.to_dict(), "effectiveness_id": row.id if row else ""},
+                [
+                    _assertion("success aggregate exists", row is not None and row.successes >= 1),
+                    _assertion("successful skill is selected", selected.name == "code.local_task"),
+                ],
+            )
+        ]
+    return _suite_payload("skill-effectiveness", cases)
+
+
+def _run_long_task_worker_suite(home: Path) -> dict[str, object]:
+    task = TaskManager(home).add_task(
+        workflow_id="simple_chat",
+        input_text="List project test command through worker.",
+        title="Worker eval task",
+        source="eval",
+    )
+    worker_result = AgentWorker(home).run_once()
+    with session_scope(home) as session:
+        refreshed = session.get(TaskItem, task.id)
+        cases = [
+            _case(
+                "serve-once-processes-task",
+                {
+                    "task_id": task.id,
+                    "agent_run_id": refreshed.agent_run_id if refreshed else "",
+                    "worker_result": worker_result.__dict__,
+                },
+                [
+                    _assertion("task is completed", refreshed is not None and refreshed.status == "completed"),
+                    _assertion("agent run id is linked", refreshed is not None and bool(refreshed.agent_run_id)),
+                    _assertion("progress artifact is linked", refreshed is not None and bool(refreshed.progress_artifact_id)),
+                    _assertion("resume cursor is recorded", refreshed is not None and refreshed.resume_cursor_json != "{}"),
+                ],
+            )
+        ]
+    return _suite_payload("long-task-worker", cases)
+
+
+def _run_agent_replan_suite(home: Path) -> dict[str, object]:
+    result = AgentRunController(home).run(
+        "Use missing.provider.force_fail to build a recoverable report.",
+        channel="eval",
+        external_user_id="agent-replan",
+        max_iterations=2,
+    )
+    with session_scope(home) as session:
+        iterations = (
+            session.execute(
+                select(AgentIteration)
+                .where(AgentIteration.agent_run_id == result.agent_run_id)
+                .order_by(AgentIteration.iteration_index)
+            )
+            .scalars()
+            .all()
+        )
+        cases = [
+            _case(
+                "agent-stops-with-explicit-reason",
+                {"agent_run_id": result.agent_run_id, "iteration_count": len(iterations), "stop_reason": result.stop_reason},
+                [
+                    _assertion("bounded iteration loop returns", bool(result.agent_run_id)),
+                    _assertion("stop reason is explicit", result.stop_reason in {"success", "max_iterations_reached"}),
+                    _assertion("iteration count respects max", len(iterations) <= 2),
+                ],
+            )
+        ]
+    return _suite_payload("agent-replan", cases)
 
 
 def _run_smoke_suite(home: Path) -> dict[str, object]:

@@ -91,7 +91,7 @@ def test_runtime_hardening_eval_covers_repaired_runtime_paths(tmp_path: Path, ca
     assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
 
     listed = runner.invoke(app, ["eval", "list"])
-    result = runner.invoke(app, ["eval", "run", "runtime-hardening", "--home", str(home)])
+    result = runner.invoke(app, ["eval", "run", "runtime-hardening", "--home", str(home), "--shared-home"])
 
     assert listed.exit_code == 0
     assert "runtime-hardening" in listed.output
@@ -125,7 +125,7 @@ def test_runtime_hardening_eval_exports_failed_case_run(tmp_path: Path) -> None:
     disabled = runner.invoke(app, ["tools", "disable", "http.request", "--home", str(home)])
     assert disabled.exit_code == 0, disabled.output
 
-    result = runner.invoke(app, ["eval", "run", "runtime-hardening", "--home", str(home)])
+    result = runner.invoke(app, ["eval", "run", "runtime-hardening", "--home", str(home), "--shared-home"])
 
     assert result.exit_code == 0, result.output
     payload = _report(runner, home, _eval_id(result.output))
@@ -147,7 +147,7 @@ def test_failed_tools_smoke_eval_exports_failed_run(tmp_path: Path) -> None:
     disabled = runner.invoke(app, ["tools", "disable", "shell.run", "--home", str(home)])
     assert disabled.exit_code == 0, disabled.output
 
-    result = runner.invoke(app, ["eval", "run", "tools-smoke", "--home", str(home)])
+    result = runner.invoke(app, ["eval", "run", "tools-smoke", "--home", str(home), "--shared-home"])
 
     assert result.exit_code == 0, result.output
     payload = _report(runner, home, _eval_id(result.output))

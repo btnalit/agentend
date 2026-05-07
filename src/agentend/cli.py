@@ -10,6 +10,7 @@ import typer
 from sqlalchemy import select
 
 from agentend.config import load_config, set_llm_config
+from agentend.core.agent_run import AgentRunController
 from agentend.core.capabilities import query_capabilities, refresh_capabilities
 from agentend.core.clipboard import ClipboardUnavailable, read_clipboard, write_clipboard
 from agentend.core.conversation import ConversationService
@@ -19,10 +20,16 @@ from agentend.core.doctor import doctor_json, run_doctor
 from agentend.core.evidence import evidence_manifest_for_run
 from agentend.core.episodes import episode_to_dict, promote_episode_to_skill, summarize_run
 from agentend.core.errors import classify_exception
+from agentend.core.effectiveness import effectiveness_rows, effectiveness_summary_dict
 from agentend.core.eval_harness import list_eval_suites, run_eval_suite
 from agentend.core.goal_analyzer import analyze_goal, goal_analysis_text
 from agentend.core.init import initialize_home
 from agentend.core.llm_router import LLMRouter
+from agentend.core.memory_consolidator import (
+    consolidate_memory_candidates,
+    extract_memory_candidates,
+    memory_candidate_to_dict,
+)
 from agentend.core.memory_store import edit_memory_item, forget_memory_item, search_memory_items, write_memory_item
 from agentend.core.model_routing import list_routes, set_budget, set_route
 from agentend.core.profile import load_agent_profile
@@ -49,6 +56,7 @@ from agentend.core.workflow_registry import WorkflowRegistry
 from agentend.core.workflow_runner import WorkflowRunFailed, WorkflowRunner
 from agentend.core.workflow_schema import load_workflow_yaml
 from agentend.core.events import record_event
+from agentend.core.worker import AgentWorker
 from agentend.mcp.manager import MCPManager
 from agentend.telegram_bot import serve_telegram
 from agentend.db.models import (
@@ -103,6 +111,7 @@ logs_app = typer.Typer(help="Log inspection commands.", no_args_is_help=True)
 tools_app = typer.Typer(help="Tool registry commands.", no_args_is_help=True)
 skills_app = typer.Typer(help="Skill library commands.", no_args_is_help=True)
 skill_markets_app = typer.Typer(help="Skill market commands.", no_args_is_help=True)
+skill_effectiveness_app = typer.Typer(help="Skill effectiveness commands.", no_args_is_help=True)
 extensions_app = typer.Typer(help="Extension lifecycle commands.", no_args_is_help=True)
 secrets_app = typer.Typer(help="Secret reference commands.", no_args_is_help=True)
 models_app = typer.Typer(help="Model routing commands.", no_args_is_help=True)
@@ -121,6 +130,7 @@ project_profile_app = typer.Typer(help="Project profile commands.", no_args_is_h
 artifacts_app = typer.Typer(help="Artifact commands.", no_args_is_help=True)
 storage_app = typer.Typer(help="Storage governance commands.", no_args_is_help=True)
 capabilities_app = typer.Typer(help="Capability map commands.", no_args_is_help=True)
+capability_effectiveness_app = typer.Typer(help="Capability effectiveness commands.", no_args_is_help=True)
 sources_app = typer.Typer(help="Source evidence commands.", no_args_is_help=True)
 goal_app = typer.Typer(help="Goal analysis commands.", no_args_is_help=True)
 plan_app = typer.Typer(help="Planning recovery commands.", no_args_is_help=True)
@@ -139,6 +149,7 @@ app.add_typer(telegram_app, name="telegram")
 app.add_typer(logs_app, name="logs")
 app.add_typer(tools_app, name="tools")
 skills_app.add_typer(skill_markets_app, name="markets")
+skills_app.add_typer(skill_effectiveness_app, name="effectiveness")
 app.add_typer(skills_app, name="skills")
 app.add_typer(extensions_app, name="extensions")
 app.add_typer(secrets_app, name="secrets")
@@ -158,6 +169,7 @@ app.add_typer(project_app, name="project")
 app.add_typer(artifacts_app, name="artifacts")
 app.add_typer(storage_app, name="storage")
 app.add_typer(capabilities_app, name="capabilities")
+capabilities_app.add_typer(capability_effectiveness_app, name="effectiveness")
 app.add_typer(sources_app, name="sources")
 app.add_typer(goal_app, name="goal")
 app.add_typer(plan_app, name="plan")
@@ -522,6 +534,23 @@ def skills_refresh(
             typer.echo(row.id)
 
 
+@skill_effectiveness_app.command("show")
+def skills_effectiveness_show(
+    skill_id: str,
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Show recorded effectiveness for one skill."""
+    resolved_home = home or Path.cwd()
+    init_database(resolved_home)
+    with session_scope(resolved_home) as session:
+        rows = effectiveness_rows(session, capability_type="skill", capability_id=skill_id)
+        if not rows:
+            typer.echo(f"No effectiveness rows for skill: {skill_id}")
+            return
+        for row in rows:
+            typer.echo(_effectiveness_line(row))
+
+
 @skill_markets_app.command("list")
 def skill_markets_list(
     home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
@@ -749,13 +778,33 @@ def eval_run(
     home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
     skill: Optional[str] = typer.Option(None, "--skill", help="Run skills-smoke for one installed skill id."),
     skill_path: Optional[Path] = typer.Option(None, "--skill-path", help="Run skills-smoke for one local skill bundle path."),
+    shared_home: bool = typer.Option(False, "--shared-home/--isolated-home", help="Use the provided home directly instead of an isolated suite home."),
 ) -> None:
     """Run an agent eval suite."""
-    resolved_home = home or Path.cwd()
-    init_database(resolved_home)
-    with session_scope(resolved_home) as session:
-        result = run_eval_suite(resolved_home, session, suite, skill=skill, skill_path=skill_path)
-        typer.echo(f"Eval: {result.id}  {result.status}")
+    base_home = (home or Path.cwd()).expanduser().resolve()
+    init_database(base_home)
+    effective_home = base_home if shared_home else _isolated_eval_home(base_home, suite)
+    if not shared_home:
+        initialize_home(effective_home, force=True)
+    else:
+        init_database(effective_home)
+    with session_scope(effective_home) as session:
+        result = run_eval_suite(effective_home, session, suite, skill=skill, skill_path=skill_path)
+        payload = result.result | {"effective_home": str(effective_home), "shared_home": shared_home}
+        row = session.get(EvalRun, result.id)
+        if row is not None:
+            row.result_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if effective_home != base_home:
+        with session_scope(base_home) as session:
+            session.add(
+                EvalRun(
+                    id=result.id,
+                    suite=result.suite,
+                    status=result.status,
+                    result_json=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                )
+            )
+    typer.echo(f"Eval: {result.id}  {result.status}")
 
 
 @eval_app.command("report")
@@ -769,6 +818,11 @@ def eval_report(
         if row is None:
             raise typer.BadParameter(f"Unknown eval run: {eval_run_id}")
         typer.echo(row.result_json)
+
+
+def _isolated_eval_home(base_home: Path, suite: str) -> Path:
+    safe_suite = "".join(char if char.isalnum() or char in "._-" else "_" for char in suite).strip("._") or "suite"
+    return base_home / "eval-homes" / f"{safe_suite}-{uuid4().hex[:12]}"
 
 
 @context_policy_app.command("set")
@@ -1020,6 +1074,62 @@ def memory_list(
             stmt = stmt.where(MemoryItem.scope == scope)
         for row in session.execute(stmt.order_by(MemoryItem.created_at)).scalars().all():
             typer.echo(f"{row.id}  {row.scope}  {row.content}")
+
+
+@memory_app.command("candidates")
+def memory_candidates(
+    agent_run_id: Optional[str] = typer.Option(None, "--agent-run", help="AgentRun id."),
+    run_id: Optional[str] = typer.Option(None, "--run", help="Workflow run id."),
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """List memory candidates extracted from an agent or workflow run."""
+    if not agent_run_id and not run_id:
+        raise typer.BadParameter("Provide --agent-run or --run")
+    resolved_home = home or Path.cwd()
+    init_database(resolved_home)
+    with session_scope(resolved_home) as session:
+        try:
+            rows = extract_memory_candidates(session, agent_run_id=agent_run_id, run_id=run_id)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        typer.echo(json.dumps([memory_candidate_to_dict(row) for row in rows], ensure_ascii=False, indent=2, sort_keys=True))
+
+
+@memory_app.command("consolidate")
+def memory_consolidate(
+    agent_run_id: Optional[str] = typer.Option(None, "--agent-run", help="AgentRun id."),
+    run_id: Optional[str] = typer.Option(None, "--run", help="Workflow run id."),
+    auto_relations: bool = typer.Option(True, "--auto-relations/--no-auto-relations", help="Classify related active memories before creating new long-term memory."),
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Merge pending memory candidates into the Memory Store."""
+    resolved_home = home or Path.cwd()
+    init_database(resolved_home)
+    with session_scope(resolved_home) as session:
+        try:
+            result = consolidate_memory_candidates(
+                session,
+                agent_run_id=agent_run_id,
+                run_id=run_id,
+                auto_relations=auto_relations,
+                home=resolved_home,
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        typer.echo(
+            "Memory consolidation: "
+            f"candidates={result.candidate_count} "
+            f"created={result.created_count} "
+            f"merged={result.merged_count} "
+            f"skipped={result.skipped_count}"
+            f" superseded={result.superseded_count}"
+            f" conflicts={result.conflict_count}"
+            f" reinforced={result.reinforced_count}"
+            f" needs_review={result.needs_review_count}"
+            f" conflict_candidates={result.conflict_candidate_count}"
+        )
+        for memory_id in result.memory_ids:
+            typer.echo(f"Memory: {memory_id}")
 
 
 @memory_app.command("edit")
@@ -1405,6 +1515,23 @@ def capabilities_query(
             typer.echo(f"{row.name}  {row.action_summary}")
 
 
+@capability_effectiveness_app.command("show")
+def capabilities_effectiveness_show(
+    capability_id: str,
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Show recorded effectiveness for a capability."""
+    resolved_home = home or Path.cwd()
+    init_database(resolved_home)
+    with session_scope(resolved_home) as session:
+        rows = effectiveness_rows(session, capability_id=capability_id)
+        if not rows:
+            typer.echo(f"No effectiveness rows for capability: {capability_id}")
+            return
+        for row in rows:
+            typer.echo(_effectiveness_line(row))
+
+
 @sources_app.command("list")
 def sources_list(
     run_id: str = typer.Option(..., "--run", help="Run id."),
@@ -1545,6 +1672,20 @@ def _skill_manifest_dict(row: Skill) -> dict:
     return manifest
 
 
+def _effectiveness_line(row) -> str:
+    payload = effectiveness_summary_dict(row)
+    return (
+        f"{payload['capability_id']}  "
+        f"type={payload['capability_type']}  "
+        f"goal_type={payload['goal_type']}  "
+        f"attempts={payload['attempts']}  "
+        f"successes={payload['successes']}  "
+        f"failures={payload['failures']}  "
+        f"blocked={payload['blocked']}  "
+        f"avg_duration_ms={payload['avg_duration_ms']}"
+    )
+
+
 @db_app.command("init")
 def db_init(
     home: Optional[Path] = typer.Option(
@@ -1587,10 +1728,20 @@ def chat(
         help="AgentEnd home directory. Defaults to the current directory.",
     ),
     message: Optional[str] = typer.Option(None, "--message", "-m", help="Send one message and exit."),
+    agent: bool = typer.Option(False, "--agent", help="Use the explicit AgentRun loop instead of the default workflow chat."),
 ) -> None:
     """Start a local CLI conversation."""
-    service = ConversationService(home or Path.cwd())
+    resolved_home = home or Path.cwd()
+    service = ConversationService(resolved_home)
     if message is not None:
+        if agent:
+            result = AgentRunController(resolved_home).run(message, channel="cli", external_user_id="local")
+            typer.echo(f"AgentRun: {result.agent_run_id}")
+            typer.echo(f"Status: {result.status}")
+            if result.linked_run_id:
+                typer.echo(f"Run: {result.linked_run_id}")
+            typer.echo(result.content)
+            return
         response = service.handle_message("cli", "local", message)
         typer.echo(f"Run: {response.run_id}")
         typer.echo(response.content)
@@ -1601,9 +1752,42 @@ def chat(
         text = typer.prompt("You")
         if text.strip() in {"/exit", "exit", "quit"}:
             break
+        if agent:
+            result = AgentRunController(resolved_home).run(text, channel="cli", external_user_id="local")
+            typer.echo(f"AgentRun: {result.agent_run_id}")
+            typer.echo(result.content)
+            continue
         response = service.handle_message("cli", "local", text)
         typer.echo(f"Run: {response.run_id}")
         typer.echo(response.content)
+
+
+@app.command("serve")
+def serve(
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+    once: bool = typer.Option(False, "--once", help="Process one worker tick and exit."),
+    poll_interval: int = typer.Option(10, "--poll-interval", help="Polling interval in seconds."),
+    max_concurrency: int = typer.Option(1, "--max-concurrency", help="Worker concurrency. First slice supports 1."),
+) -> None:
+    """Run the local long-task worker loop."""
+    if max_concurrency != 1:
+        raise typer.BadParameter("--max-concurrency currently only supports 1")
+    resolved_home = home or Path.cwd()
+    worker = AgentWorker(resolved_home)
+    if once:
+        result = worker.run_once()
+        if result.processed_tasks:
+            typer.echo(
+                f"processed={result.processed_tasks} "
+                f"created={result.created_tasks} "
+                f"schedules={result.schedule_count}"
+            )
+            for agent_run_id in result.agent_run_ids:
+                typer.echo(f"AgentRun: {agent_run_id}")
+        else:
+            typer.echo(f"no work created={result.created_tasks} schedules={result.schedule_count}")
+        return
+    worker.run_forever(poll_interval=poll_interval, max_concurrency=max_concurrency)
 
 
 @llm_app.command("list")
@@ -1650,11 +1834,93 @@ def llm_test(
 
 @agent_app.command("show")
 def agent_show(
+    agent_run_id: Optional[str] = typer.Argument(None, help="Optional AgentRun id. Omit to print the agent profile."),
     home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
 ) -> None:
-    """Print the current local agent profile."""
-    profile = load_agent_profile(load_config(home or Path.cwd()))
-    typer.echo(profile.content)
+    """Print the current local agent profile or one AgentRun."""
+    resolved_home = home or Path.cwd()
+    if agent_run_id is None:
+        profile = load_agent_profile(load_config(resolved_home))
+        typer.echo(profile.content)
+        return
+    try:
+        payload = AgentRunController(resolved_home).show(agent_run_id)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+@agent_app.command("run")
+def agent_run(
+    goal: str,
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+    max_iterations: int = typer.Option(3, "--max-iterations", help="Maximum agent loop iterations."),
+) -> None:
+    """Run a goal through the explicit AgentRunController loop."""
+    resolved_home = home or Path.cwd()
+    try:
+        result = AgentRunController(resolved_home).run(goal, max_iterations=max_iterations, channel="cli", external_user_id="local")
+    except Exception as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(1) from exc
+    typer.echo(f"AgentRun: {result.agent_run_id}")
+    typer.echo(f"Status: {result.status}")
+    typer.echo(f"Stop reason: {result.stop_reason}")
+    if result.linked_run_id:
+        typer.echo(f"Run: {result.linked_run_id}")
+    if result.progress_artifact_id:
+        typer.echo(f"Progress: {result.progress_artifact_id}")
+    typer.echo(result.content)
+
+
+@agent_app.command("iterations")
+def agent_iterations(
+    agent_run_id: str,
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """List iterations for one AgentRun."""
+    try:
+        rows = AgentRunController(home or Path.cwd()).iterations(agent_run_id)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    for row in rows:
+        typer.echo(json.dumps(row, ensure_ascii=False, sort_keys=True))
+
+
+@agent_app.command("resume")
+def agent_resume(
+    agent_run_id: str,
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+    max_iterations: int = typer.Option(3, "--max-iterations", help="Maximum resumed loop iterations."),
+) -> None:
+    """Resume by starting a new AgentRun from the previous goal."""
+    resolved_home = home or Path.cwd()
+    try:
+        previous = AgentRunController(resolved_home).show(agent_run_id)
+        result = AgentRunController(resolved_home).run(
+            str(previous["goal"]),
+            channel=str(previous["channel"]),
+            external_user_id=str(previous["external_user_id"]),
+            max_iterations=max_iterations,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"AgentRun: {result.agent_run_id}")
+    typer.echo(f"Status: {result.status}")
+    typer.echo(result.content)
+
+
+@agent_app.command("cancel")
+def agent_cancel(
+    agent_run_id: str,
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Mark an AgentRun cancelled."""
+    try:
+        payload = AgentRunController(home or Path.cwd()).cancel(agent_run_id)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 
 @agent_app.command("reload")
