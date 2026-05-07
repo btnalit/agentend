@@ -70,7 +70,7 @@ def test_telegram_message_from_other_chat_does_not_answer_pending_request(tmp_pa
     run_id = _run_id(started)
     other_reply = router.handle_text("chat-2", "user-2", "not your answer")
 
-    assert "Echo: not your answer" in other_reply
+    assert "Fake LLM: not your answer" in other_reply
     with session_scope(home) as session:
         request = session.execute(select(ClarificationRequest).where(ClarificationRequest.run_id == run_id)).scalar_one()
         run = session.get(Run, run_id)

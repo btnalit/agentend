@@ -1974,6 +1974,29 @@ def workflows_run(
     output_format: str = typer.Option("text", "--output", help="Output format: text or json."),
 ) -> None:
     """Run a workflow by id."""
+    _run_workflow_by_id(workflow_id, home=home, input_text=input_text, stdin_input=stdin_input, output_format=output_format)
+
+
+@app.command("run")
+def run_workflow_alias(
+    workflow_id: str,
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+    input_text: str = typer.Option("", "--input", help="Workflow input text."),
+    stdin_input: bool = typer.Option(False, "--stdin", help="Read workflow input from stdin."),
+    output_format: str = typer.Option("text", "--output", help="Output format: text or json."),
+) -> None:
+    """Run a workflow by id."""
+    _run_workflow_by_id(workflow_id, home=home, input_text=input_text, stdin_input=stdin_input, output_format=output_format)
+
+
+def _run_workflow_by_id(
+    workflow_id: str,
+    *,
+    home: Optional[Path],
+    input_text: str,
+    stdin_input: bool,
+    output_format: str,
+) -> None:
     if output_format not in {"text", "json"}:
         raise typer.BadParameter("--output must be text or json")
     resolved_home = home or Path.cwd()

@@ -74,6 +74,78 @@ def test_openai_compatible_llm_test_and_workflow_use_real_http_fixture(tmp_path:
         assert usage.usage_source == "provider"
 
 
+def test_openai_compatible_llm_accepts_full_chat_completions_endpoint(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+
+    with _LLMFixture() as fixture:
+        _configure_openai_llm(home, f"{fixture.base_url}/chat/completions")
+        monkeypatch.setenv("AGENTEND_TEST_OPENAI_KEY", "secret-value-that-must-not-leak")
+
+        tested = runner.invoke(app, ["llm", "test", "--home", str(home)])
+
+    assert tested.exit_code == 0, tested.output
+    assert fixture.requests == ["ping"]
+
+
+def test_workflow_llm_request_includes_context_pack_items(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+    (home / "agent.md").write_text("# Agent Profile\n\nQ3_CONTEXT_MARKER\n", encoding="utf-8")
+
+    with _LLMFixture() as fixture:
+        _configure_openai_llm(home, fixture.base_url)
+        monkeypatch.setenv("AGENTEND_TEST_OPENAI_KEY", "secret-value-that-must-not-leak")
+
+        workflow = runner.invoke(app, ["workflows", "run", "simple_chat", "--home", str(home), "--input", "context input"])
+
+    assert workflow.exit_code == 0, workflow.output
+    messages = fixture.message_batches[0]
+    assert any("Q3_CONTEXT_MARKER" in message["content"] for message in messages)
+    assert messages[-1] == {"role": "user", "content": "context input"}
+
+
+def test_workflow_llm_keeps_prompt_when_context_budget_is_tight(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+    workflow = home / "workflows" / "definitions" / "tight_context_prompt.yaml"
+    workflow.write_text(
+        """
+id: tight_context_prompt
+name: Tight Context Prompt
+description: Prompt must remain in the request when context limits are tight.
+nodes:
+  - id: ask
+    type: llm
+    context:
+      max_items: 2
+    prompt: "Budget prompt: {input}"
+  - id: final
+    type: final
+    depends_on: [ask]
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    with _LLMFixture() as fixture:
+        _configure_openai_llm(home, fixture.base_url)
+        monkeypatch.setenv("AGENTEND_TEST_OPENAI_KEY", "secret-value-that-must-not-leak")
+
+        workflow_run = runner.invoke(
+            app,
+            ["workflows", "run", "tight_context_prompt", "--home", str(home), "--input", "tight input"],
+        )
+
+    assert workflow_run.exit_code == 0, workflow_run.output
+    assert fixture.message_batches[0][-1] == {
+        "role": "user",
+        "content": "Budget prompt: tight input",
+    }
+
+
 def test_chat_run_records_agent_profile_hash_and_llm_config(tmp_path: Path) -> None:
     home = tmp_path / "agentend-home"
     runner = CliRunner()
@@ -81,7 +153,7 @@ def test_chat_run_records_agent_profile_hash_and_llm_config(tmp_path: Path) -> N
     assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
     assert runner.invoke(
         app,
-        ["llm", "set", "--home", str(home), "--provider", "openai", "--model", "gpt-4.1-mini"],
+        ["llm", "set", "--home", str(home), "--provider", "fake", "--model", "fake-model"],
     ).exit_code == 0
 
     profile = home / "agent.md"
@@ -91,12 +163,14 @@ def test_chat_run_records_agent_profile_hash_and_llm_config(tmp_path: Path) -> N
     chat = runner.invoke(app, ["chat", "--home", str(home), "--message", "remember profile"])
 
     assert chat.exit_code == 0
+    assert "Fake LLM: remember profile" in chat.output
     with session_scope(home) as session:
         run = session.execute(select(Run)).scalar_one()
+        assert run.workflow_id == "simple_chat"
         assert run.agent_profile_path == str(profile)
         assert run.agent_profile_hash == expected_hash
-        assert run.llm_provider == "openai"
-        assert run.llm_model == "gpt-4.1-mini"
+        assert run.llm_provider == "fake"
+        assert run.llm_model == "fake-model"
 
 
 def _configure_openai_llm(home: Path, base_url: str) -> None:
@@ -120,6 +194,7 @@ base_url = "{base_url}"
 class _LLMFixture:
     def __init__(self) -> None:
         self.requests: list[str] = []
+        self.message_batches: list[list[dict[str, str]]] = []
         self.server: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
 
@@ -132,7 +207,9 @@ class _LLMFixture:
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 assert self.path == "/v1/chat/completions"
                 assert self.headers.get("Authorization") == "Bearer secret-value-that-must-not-leak"
-                prompt = payload["messages"][0]["content"]
+                messages = payload["messages"]
+                owner.message_batches.append(messages)
+                prompt = messages[-1]["content"]
                 owner.requests.append(prompt)
                 body = json.dumps(
                     {

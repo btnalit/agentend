@@ -85,7 +85,7 @@ def test_skills_smoke_eval_runs_builtin_skills(tmp_path: Path) -> None:
         assert all(assertion["status"] == "passed" for assertion in case["assertions"])
 
 
-def test_runtime_hardening_eval_covers_repaired_runtime_paths(tmp_path: Path) -> None:
+def test_runtime_hardening_eval_covers_repaired_runtime_paths(tmp_path: Path, caplog) -> None:
     home = tmp_path / "agentend-home"
     runner = CliRunner()
     assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
@@ -111,6 +111,7 @@ def test_runtime_hardening_eval_covers_repaired_runtime_paths(tmp_path: Path) ->
         "evidence-export",
     } <= set(cases)
     assert Path(cases["evidence-export"]["export_path"]).exists()
+    assert "Future exception was never retrieved" not in caplog.text
     for case in cases.values():
         assert case["status"] == "passed"
         assert case["assertions"]

@@ -3,6 +3,7 @@ import time
 from typing import Any
 from uuid import uuid4
 
+from agentend.core.secrets import redact_text
 from agentend.db.models import MCPServer, MCPToolCall
 from agentend.mcp.client import MCPClient
 from agentend.tools.base import ToolContext, ToolResult
@@ -29,7 +30,7 @@ class MCPRegisteredTool:
             step_id=context.step_id,
             server_name=server.name,
             tool_name=self.tool_name,
-            input_json=json.dumps(input_data, ensure_ascii=False, sort_keys=True),
+            input_json=redact_text(context.home, json.dumps(input_data, ensure_ascii=False, sort_keys=True)),
             output_json="{}",
             status="running",
         )
@@ -37,11 +38,11 @@ class MCPRegisteredTool:
         try:
             result = self.client.call_tool(server, self.tool_name, input_data)
             call.status = "completed"
-            call.output_json = json.dumps(result.data, ensure_ascii=False, sort_keys=True)
+            call.output_json = redact_text(context.home, json.dumps(result.data, ensure_ascii=False, sort_keys=True))
             call.latency_ms = int((time.perf_counter() - started) * 1000)
             return ToolResult(content=result.content, data=result.data)
         except Exception as exc:
             call.status = "failed"
-            call.error = str(exc)
+            call.error = redact_text(context.home, str(exc))
             call.latency_ms = int((time.perf_counter() - started) * 1000)
             raise

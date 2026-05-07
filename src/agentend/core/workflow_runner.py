@@ -9,7 +9,13 @@ from sqlalchemy.orm import Session
 
 from agentend.config import load_config
 from agentend.core.clarifications import answer_clarification, create_clarification_request, pending_clarification_for_run
-from agentend.core.context_runtime import create_checkpoint, estimate_tokens, record_context_ledger
+from agentend.core.context_runtime import (
+    build_context_pack,
+    context_pack_to_messages,
+    create_checkpoint,
+    estimate_tokens,
+    record_context_ledger,
+)
 from agentend.core.errors import record_error
 from agentend.core.events import record_event
 from agentend.core.llm_router import LLMRouter
@@ -54,6 +60,7 @@ class WorkflowRunner:
         channel: str = "cli",
         external_user_id: str = "workflow",
         run_mode: str = "normal",
+        conversation_id: str | None = None,
     ) -> WorkflowRunResult:
         config = load_config(self.home)
         profile = load_agent_profile(config)
@@ -65,13 +72,18 @@ class WorkflowRunner:
         failure: WorkflowRunFailed | None = None
 
         with session_scope(self.home) as session:
-            conversation = Conversation(
-                id=str(uuid4()),
-                channel=channel,
-                external_user_id=external_user_id,
-                title=user_input[:80],
-            )
-            session.add(conversation)
+            if conversation_id is not None:
+                conversation = session.get(Conversation, conversation_id)
+                if conversation is None:
+                    raise ValueError(f"Unknown conversation: {conversation_id}")
+            else:
+                conversation = Conversation(
+                    id=str(uuid4()),
+                    channel=channel,
+                    external_user_id=external_user_id,
+                    title=user_input[:80],
+                )
+                session.add(conversation)
             run = Run(
                 id=str(uuid4()),
                 conversation_id=conversation.id,
@@ -259,6 +271,14 @@ class WorkflowRunner:
                 resolved_workflow_context = workflow_context or self._workflow_for_context(session, run_id)
                 route = resolve_model_route(llm.config, session, "workflow_step")
                 routed_llm = LLMRouter(self._config_for_route(llm.config, route.provider, route.model))
+                context_pack = build_context_pack(
+                    self.home,
+                    workflow=resolved_workflow_context,
+                    user_input=user_input,
+                    prompt=prompt,
+                    step_policy=node.context,
+                    session=session,
+                )
                 ledger = record_context_ledger(
                     session,
                     self.home,
@@ -271,9 +291,10 @@ class WorkflowRunner:
                     model_provider=route.provider,
                     model_model=route.model,
                     step_policy=node.context,
+                    pack=context_pack,
                 )
                 self._check_budget_after_context(session, run_id, ledger)
-                response = routed_llm.complete_response(prompt)
+                response = routed_llm.complete_response(prompt, messages=context_pack_to_messages(context_pack))
                 self._record_llm_usage(session, run_id=run_id, step_id=step.id, ledger=ledger, response=response)
                 self._check_output_budget(session, run_id, response.usage.output_tokens)
                 output = response.content

@@ -56,6 +56,24 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def context_pack_to_messages(pack: ContextPack) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    system_blocks: list[str] = []
+    user_prompt = ""
+    for item in pack.selected:
+        if item.item_type == "prompt":
+            user_prompt = item.summary
+            continue
+        if item.item_type == "task" and not user_prompt:
+            user_prompt = item.summary
+            continue
+        system_blocks.append(f"[{item.item_type}:{item.source}]\n{item.summary}")
+    if system_blocks:
+        messages.append({"role": "system", "content": "\n\n".join(system_blocks)})
+    messages.append({"role": "user", "content": user_prompt})
+    return messages
+
+
 def build_context_items(
     home: Path,
     *,
@@ -144,8 +162,10 @@ def record_context_ledger(
     model_provider: str,
     model_model: str,
     step_policy: dict | None = None,
+    pack: ContextPack | None = None,
 ) -> ContextLedger:
-    pack = build_context_pack(home, workflow=workflow, user_input=user_input, prompt=prompt, step_policy=step_policy, session=session)
+    if pack is None:
+        pack = build_context_pack(home, workflow=workflow, user_input=user_input, prompt=prompt, step_policy=step_policy, session=session)
     items = pack.selected
     ledger = ContextLedger(
         id=str(uuid4()),
@@ -204,6 +224,13 @@ def _select_with_budget(items: list[ContextItem], policy: dict) -> tuple[list[Co
     dropped: list[DroppedContextItem] = []
     used_tokens = 0
     for item in items:
+        if item.item_type != "prompt":
+            continue
+        selected.append(item)
+        used_tokens += item.token_estimate
+    for item in items:
+        if item.item_type == "prompt":
+            continue
         if len(selected) >= max_items:
             dropped.append(DroppedContextItem(item, "max_items_exceeded"))
             continue

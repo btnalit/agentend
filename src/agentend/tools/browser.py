@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import gc
+import logging
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 from importlib.util import find_spec
@@ -198,9 +201,7 @@ def playwright_status() -> PlaywrightStatus:
             message="playwright package is not installed",
         )
     try:
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as runner:
+        with _quiet_sync_playwright() as runner:
             browser = runner.chromium.launch(headless=True)
             browser.close()
         return PlaywrightStatus(package_available=True, browser_available=True, message="chromium browser is available")
@@ -210,9 +211,7 @@ def playwright_status() -> PlaywrightStatus:
 
 def _try_playwright_page(url: str) -> tuple[dict | None, str | None]:
     try:
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as runner:
+        with _quiet_sync_playwright() as runner:
             browser = runner.chromium.launch(headless=True)
             page = browser.new_page()
             page.goto(url, wait_until="domcontentloaded")
@@ -235,9 +234,7 @@ def _try_playwright_page(url: str) -> tuple[dict | None, str | None]:
 
 def _try_playwright_screenshot(url: str, output: Path) -> tuple[dict | None, str | None]:
     try:
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as runner:
+        with _quiet_sync_playwright() as runner:
             browser = runner.chromium.launch(headless=True)
             page = browser.new_page()
             page.goto(url, wait_until="domcontentloaded")
@@ -261,9 +258,7 @@ def _try_playwright_screenshot(url: str, output: Path) -> tuple[dict | None, str
 
 def _try_playwright_action(url: str, selector: str, *, action: str, text: str = "", screenshot_path: Path) -> tuple[dict | None, str | None]:
     try:
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as runner:
+        with _quiet_sync_playwright() as runner:
             browser = runner.chromium.launch(headless=True)
             page = browser.new_page()
             page.goto(url, wait_until="domcontentloaded")
@@ -325,6 +320,43 @@ def _placeholder_png() -> bytes:
 
 def _short_error(exc: Exception) -> str:
     return re.sub(r"\s+", " ", str(exc)).strip()[:500] or exc.__class__.__name__
+
+
+@contextmanager
+def _suppress_playwright_asyncio_noise():
+    logger = logging.getLogger("asyncio")
+    previous_disabled = logger.disabled
+    logger.disabled = True
+    try:
+        yield
+    finally:
+        gc.collect()
+        logger.disabled = previous_disabled
+
+
+@contextmanager
+def _quiet_sync_playwright():
+    from playwright.sync_api import sync_playwright
+
+    manager = sync_playwright()
+    try:
+        with _suppress_playwright_asyncio_noise():
+            runner = manager.__enter__()
+        try:
+            yield runner
+        finally:
+            manager.__exit__(None, None, None)
+    except Exception:
+        _drain_playwright_transport_error(manager)
+        raise
+
+
+def _drain_playwright_transport_error(manager: object) -> None:
+    connection = getattr(manager, "_connection", None)
+    transport = getattr(connection, "_transport", None)
+    future = getattr(transport, "on_error_future", None)
+    if future is not None and future.done() and not future.cancelled():
+        future.exception()
 
 
 BROWSER_TOOLS = [

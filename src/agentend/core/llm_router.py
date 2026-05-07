@@ -56,7 +56,9 @@ class LLMRouter:
     def complete(self, prompt: str) -> str:
         return self.complete_response(prompt).content
 
-    def complete_response(self, prompt: str) -> LLMResponse:
+    def complete_response(self, prompt: str, messages: list[dict[str, str]] | None = None) -> LLMResponse:
+        request_messages = messages or [{"role": "user", "content": prompt}]
+        request_text = "\n".join(message["content"] for message in request_messages)
         if self.config.llm.provider == "fake":
             content = f"Fake LLM: {prompt}"
             return LLMResponse(
@@ -64,9 +66,9 @@ class LLMRouter:
                 provider="fake",
                 model=self.config.llm.model,
                 usage=LLMUsage(
-                    input_tokens=_estimate_tokens(prompt),
+                    input_tokens=_estimate_tokens(request_text),
                     output_tokens=_estimate_tokens(content),
-                    total_tokens=_estimate_tokens(prompt) + _estimate_tokens(content),
+                    total_tokens=_estimate_tokens(request_text) + _estimate_tokens(content),
                 ),
             )
 
@@ -78,10 +80,10 @@ class LLMRouter:
         base_url = self.config.llm.provider_config.base_url.rstrip("/")
         if not base_url:
             raise RuntimeError(f"LLM provider base_url is not configured: {self.config.llm.provider}")
-        url = f"{base_url}/chat/completions"
+        url = chat_completions_url(base_url)
         payload = {
             "model": self.config.llm.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": request_messages,
             "temperature": self.config.llm.temperature,
             "max_tokens": self.config.llm.max_tokens,
         }
@@ -115,7 +117,7 @@ class LLMRouter:
             raise RuntimeError("LLM provider response is missing message content")
 
         usage_payload = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-        input_tokens = int(usage_payload.get("prompt_tokens") or _estimate_tokens(prompt))
+        input_tokens = int(usage_payload.get("prompt_tokens") or _estimate_tokens(request_text))
         output_tokens = int(usage_payload.get("completion_tokens") or _estimate_tokens(str(content)))
         total_tokens = int(usage_payload.get("total_tokens") or input_tokens + output_tokens)
         return LLMResponse(
@@ -128,3 +130,10 @@ class LLMRouter:
 
 def _estimate_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
+
+
+def chat_completions_url(base_url: str) -> str:
+    cleaned = base_url.rstrip("/")
+    if cleaned.endswith("/chat/completions"):
+        return cleaned
+    return f"{cleaned}/chat/completions"

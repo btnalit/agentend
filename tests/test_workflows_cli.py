@@ -62,6 +62,21 @@ nodes:
         assert {step.status for step in steps} == {"completed"}
 
 
+def test_top_level_run_alias_runs_workflow(tmp_path: Path) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+
+    result = runner.invoke(app, ["run", "simple_chat", "--home", str(home), "--input", "alias hello"])
+
+    assert result.exit_code == 0, result.output
+    assert "Fake LLM: alias hello" in result.output
+    with session_scope(home) as session:
+        run = session.execute(select(Run).where(Run.workflow_id == "simple_chat")).scalar_one()
+        assert run.status == "completed"
+
+
 def test_workflow_validate_requires_exactly_one_final_node(tmp_path: Path) -> None:
     home = tmp_path / "agentend-home"
     runner = CliRunner()

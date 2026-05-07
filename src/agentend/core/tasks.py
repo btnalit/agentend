@@ -12,7 +12,7 @@ from agentend.config import load_config
 from agentend.core.events import record_event
 from agentend.core.workflow_registry import WorkflowRegistry
 from agentend.core.workflow_runner import WorkflowRunFailed, WorkflowRunner
-from agentend.db.models import Schedule, TaskItem
+from agentend.db.models import Run, Schedule, TaskItem
 from agentend.db.session import init_database, session_scope
 
 
@@ -140,11 +140,12 @@ class TaskManager:
 
         with session_scope(self.home) as session:
             task = _get_task(session, task_id)
-            task.status = "completed"
             task.run_id = result.run_id
+            run = session.get(Run, result.run_id)
+            task.status = _task_status_for_run_status(run.status if run is not None else "completed")
             task.error = None
-            record_event(session, "task.completed", {"task_id": task.id}, run_id=result.run_id)
-        return TaskRunOutcome(task_id=task_id, status="completed", run_id=result.run_id, output=result.output)
+            record_event(session, _task_event_for_status(task.status), {"task_id": task.id}, run_id=result.run_id)
+        return TaskRunOutcome(task_id=task_id, status=task.status, run_id=result.run_id, output=result.output)
 
     def add_schedule(
         self,
@@ -356,6 +357,28 @@ def _get_schedule(session, schedule_id: str) -> Schedule:
     if schedule is None:
         raise ValueError(f"Unknown schedule: {schedule_id}")
     return schedule
+
+
+def _task_status_for_run_status(run_status: str) -> str:
+    if run_status == "completed":
+        return "completed"
+    if run_status == "waiting_input":
+        return "blocked"
+    if run_status == "failed":
+        return "failed"
+    if run_status == "running":
+        return "running"
+    return "pending"
+
+
+def _task_event_for_status(status: str) -> str:
+    if status == "completed":
+        return "task.completed"
+    if status == "blocked":
+        return "task.blocked"
+    if status == "failed":
+        return "task.failed"
+    return "task.updated"
 
 
 def _cron_due(cron: str, now: datetime) -> bool:

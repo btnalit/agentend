@@ -5,7 +5,7 @@ from sqlalchemy import select
 from typer.testing import CliRunner
 
 from agentend.cli import app
-from agentend.db.models import Capability, GeneratedTool, Schedule, TaskItem, ToolManifest
+from agentend.db.models import Capability, ErrorRecord, GeneratedTool, Run, Schedule, TaskItem, ToolManifest
 from agentend.db.session import session_scope
 
 
@@ -65,6 +65,41 @@ def test_inbox_watch_creates_task_and_task_run_resume_flow(tmp_path: Path) -> No
         resumed = session.get(TaskItem, task.id)
         assert resumed.status == "pending"
         assert resumed.input_text == "try again"
+
+
+def test_task_run_marks_waiting_input_run_as_blocked(tmp_path: Path) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+    (home / "workflows" / "definitions" / "ask_demo.yaml").write_text(
+        """id: ask_demo
+name: Ask Demo
+nodes:
+  - id: ask
+    type: human_input
+    input:
+      prompt: "Need value?"
+  - id: final
+    type: final
+    depends_on: [ask]
+""",
+        encoding="utf-8",
+    )
+    added = runner.invoke(app, ["tasks", "add", "start", "--home", str(home), "--workflow", "ask_demo"])
+    assert added.exit_code == 0
+    with session_scope(home) as session:
+        task = session.execute(select(TaskItem)).scalar_one()
+
+    run = runner.invoke(app, ["tasks", "run", task.id, "--home", str(home)])
+
+    assert run.exit_code == 0
+    assert "status=blocked" in run.output
+    assert "Need value?" in run.output
+    with session_scope(home) as session:
+        refreshed = session.get(TaskItem, task.id)
+        workflow_run = session.get(Run, refreshed.run_id)
+        assert refreshed.status == "blocked"
+        assert workflow_run.status == "waiting_input"
 
 
 def test_schedule_run_now_creates_task_and_records_run(tmp_path: Path) -> None:
@@ -153,7 +188,9 @@ nodes:
     assert "external_write is blocked during scheduler" in triggered.output
     with session_scope(home) as session:
         task = session.execute(select(TaskItem)).scalar_one()
+        errors = session.execute(select(ErrorRecord).where(ErrorRecord.run_id == task.run_id)).scalars().all()
         assert task.status == "failed"
+        assert any(error.error_code == "external_side_effect_blocked" for error in errors)
 
 
 def test_tool_generator_creates_disabled_draft_without_registering_tool(tmp_path: Path) -> None:

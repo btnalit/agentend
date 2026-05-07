@@ -1186,7 +1186,9 @@ def _runtime_llm_fixture():
                 self.send_response(401)
                 self.end_headers()
                 return
-            prompt = payload["messages"][0]["content"]
+            messages = payload.get("messages") or []
+            user_messages = [message for message in messages if message.get("role") == "user"]
+            prompt = user_messages[-1]["content"] if user_messages else ""
             fixture.requests.append(prompt)
             body = json.dumps(
                 {

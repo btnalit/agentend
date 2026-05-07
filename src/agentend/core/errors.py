@@ -31,6 +31,13 @@ def classify_exception(exc: Exception) -> ClassifiedError:
         return ClassifiedError("permission_error", message, False, "Check provider credentials and permissions.")
     if "status 5" in lowered or "network error" in lowered or "provider request failed" in lowered:
         return ClassifiedError("network_error", message, True, "Retry or switch provider.")
+    if " is blocked during " in lowered:
+        return ClassifiedError(
+            "external_side_effect_blocked",
+            message,
+            False,
+            "Change the run mode, adjust action policy, or request explicit user approval.",
+        )
     if isinstance(exc, PermissionError) or "blocked" in lowered or "permission" in lowered:
         return ClassifiedError("permission_error", message, False, "Adjust the action policy or request user input.")
     if isinstance(exc, (KeyError, TypeError, ValueError)) and "unknown tool" not in lowered:

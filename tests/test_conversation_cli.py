@@ -30,4 +30,4 @@ def test_chat_message_creates_persisted_run_that_can_be_listed_and_shown(tmp_pat
 
     assert shown.exit_code == 0
     assert "hello agent" in shown.output
-    assert "Echo: hello agent" in shown.output
+    assert "Fake LLM: hello agent" in shown.output
