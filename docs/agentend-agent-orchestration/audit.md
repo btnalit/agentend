@@ -473,3 +473,127 @@ Verification notes:
 
 Residual:
 - The evaluator remains a narrow rule-based satisfaction gate. Broader semantic goal satisfaction is still future work and should be added with explicit eval cases rather than a generic LLM judge by default.
+
+## 16. Pre-Implementation Audit for Agent Quality Deepening - O33-O44 - 2026-05-07
+
+Current evaluator gap:
+- `evaluation_json` has only a small set of implicit criteria.
+- There is no persisted evaluator event table for trace grading.
+- Missing criteria are strings, not stable requirement ids.
+- There is no clean seam for a future structured LLM judge.
+
+Required fix:
+- Add a `GoalRequirement` schema and deterministic validators.
+- Persist per-iteration evaluator events.
+- Keep deterministic validation authoritative by default.
+
+Current memory quality gap:
+- `MemoryRetrieval` records retrievals, but not whether the memory affected an AgentRun result.
+- `MemoryItem.last_used_at` exists, but there is no run-level usefulness feedback.
+- There is no digest compiler or lint report for memory hygiene.
+
+Required fix:
+- Add `MemoryUseEvent` for run outcome feedback.
+- Add digest compilation for high-confidence project memories.
+- Add lint/report functions and CLI/eval surface without mutating memory.
+
+Current tool/skill orchestration gap:
+- Selector traces show score breakdown, but not explicit evidence contracts.
+- Requirement-aware scoring is currently a special-case `replan_probe`.
+- Eval coverage does not prove selector candidate contracts.
+
+Required fix:
+- Add capability contract metadata into selector traces.
+- Add transparent `requirement_match` scoring after failed/incomplete observations.
+- Add `capability-contracts` eval.
+
+Current long-task gap:
+- Progress artifacts contain raw observation/evaluation, but not a stable operator-facing state envelope.
+- Max-iteration final results do not clearly distinguish useful partial output from failure metadata.
+- Worker resume cursors do not mirror missing requirements or partial results.
+
+Required fix:
+- Add structured progress envelope.
+- Add partial result and resume cursor to max-iteration exits.
+- Mirror long-task state in worker task resume cursors.
+
+Audit checks for this slice:
+- Goal echo without evidence cannot complete a test-command goal.
+- Pytest output completes the same requirement.
+- AgentRun iterations persist evaluator events.
+- Memory use events are created for retrieved memories.
+- Memory digest is bounded and retrievable.
+- Memory lint reports issues without changing memory status.
+- Selector candidate trace includes capability contracts.
+- Missing evidence produces a visible requirement-aware selector score.
+- Progress artifacts and worker resume cursors include structured long-task state.
+
+## 17. Post-Implementation Audit for Agent Quality Deepening - O33-O44 - 2026-05-07
+
+Status: implemented and verified.
+
+Closed audit items:
+- Goal satisfaction is now requirement-level for covered goal types.
+- Test-command goals cannot complete from goal echo or generic non-empty output.
+- Evaluator trace rows are persisted per AgentRun iteration.
+- Memory retrieval now has a higher-level run outcome event through `memory_use_events`.
+- Memory digest compilation and lint reporting are available through core functions and CLI commands.
+- Selector traces expose explicit capability contracts.
+- Missing evidence produces a visible selector score component for evidence-producing capabilities.
+- Progress artifacts include a stable `progress` envelope.
+- Max-iteration failures preserve partial output, missing requirements, and a resume cursor.
+- Worker task state mirrors long-task resume metadata.
+
+Verification:
+- Initial focused red run failed on the missing O33-O44 modules/exports.
+- Focused O33-O44 tests: 9 passed.
+- Related orchestration tests: 39 passed.
+- Full suite: 161 passed.
+- Compileall: passed.
+- Eval `goal-satisfaction`: passed.
+- Eval `memory-quality`: passed.
+- Eval `capability-contracts`: passed.
+- Eval `orchestration-smoke`: passed.
+- Eval `memory-consolidation`: passed.
+- Eval `long-task-worker`: passed.
+- CLI smoke `memory digest`: passed.
+- CLI smoke `memory lint`: passed.
+
+Residual:
+- The evaluator is stronger but still intentionally narrow. A future semantic judge should be added behind explicit eval cases and should not replace deterministic gates by default.
+- Memory use feedback is conservative and outcome-based; later ranking work can use it as one signal, not as causal truth.
+- Digest compilation is short-form memory compression, not semantic conflict resolution.
+- Long-task worker remains single-concurrency for this stage.
+
+## 18. Commit Closeout Audit for Agent Quality Deepening - 2026-05-07
+
+Status: implemented and verified.
+
+Closeout findings fixed:
+- Resume reconstructed previous observations did not preserve `missing_requirements`, so selector `requirement_match` could disappear after resume even though same-run replans had it.
+- Test-command evidence detection could treat a `Goal:` line containing `pytest` as evidence.
+- Memory fallback search could lose Unicode terms after stopword filtering and could return all memories for an empty query.
+- FTS-backed memory candidate search did not apply the requested scope before returning candidates.
+- `memory_use_events` created after an initial failed run were not updated to the final completed status after resume.
+- The HTTP action test fixture did not read POST request bodies, making the second POST fail under connection reuse.
+
+Closed audit checks:
+- Resume now carries `missing_requirements` into the next selector plan and `shell.run` shows `requirement_match`.
+- Evaluator ignores `Goal:`, `Task:`, and `Request:` echo lines before checking test evidence.
+- Memory search keeps Unicode query terms, has an empty-query guard, uses fallback when FTS returns no rows, and filters scoped FTS rows.
+- Memory use events for an AgentRun are updated to the latest terminal run status/outcome.
+- HTTP fixture consumes POST bodies before responding.
+
+Verification:
+- Focused closeout tests: 9 passed.
+- Related orchestration tests: 43 passed.
+- Full suite: 165 passed.
+- Compileall: passed.
+- Eval `goal-satisfaction`: passed.
+- Eval `memory-quality`: passed.
+- Eval `capability-contracts`: passed.
+- Eval `orchestration-smoke`: passed.
+- Eval `memory-consolidation`: passed.
+- Eval `long-task-worker`: passed.
+- CLI smoke `memory digest`: passed.
+- CLI smoke `memory lint`: passed.

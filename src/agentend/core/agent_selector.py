@@ -70,6 +70,8 @@ def select_next_action_with_trace(
     }
     goal_type = _goal_type(goal, analysis)
     needs_command_probe = _needs_test_command_probe(goal, goal_type, previous)
+    requirements = _requirements_from_analysis(analysis)
+    missing_requirements = _missing_requirements(previous)
     candidates: list[dict[str, Any]] = []
 
     skill_candidates = _ordered_skill_candidates(session, goal, analysis)
@@ -77,19 +79,52 @@ def select_next_action_with_trace(
         if skill.enabled != "true":
             candidates.append(_candidate_trace("skill_run", skill.id, {}, -1.0, ["skill disabled"], {"task": goal, "goal": goal}))
             continue
-        breakdown, rejected_reasons = _score_skill(session, skill, goal, goal_type, failed_names, analysis)
+        contract = capability_contract_for("skill_run", skill.id)
+        breakdown, rejected_reasons = _score_skill(
+            session,
+            skill,
+            goal,
+            goal_type,
+            failed_names,
+            analysis,
+            requirements,
+            missing_requirements,
+            contract,
+        )
         candidates.append(
-            _candidate_trace("skill_run", skill.id, breakdown, sum(breakdown.values()), rejected_reasons, {"task": goal, "goal": goal})
+            _candidate_trace("skill_run", skill.id, breakdown, sum(breakdown.values()), rejected_reasons, {"task": goal, "goal": goal}, contract)
         )
 
     tool_candidates = _ordered_tool_candidates(session, goal, analysis)
     for tool in tool_candidates:
         if tool.enabled != "true":
-            candidates.append(_candidate_trace("tool_call", tool.name, {}, -1.0, ["tool disabled"], _tool_input(tool.name, goal)))
+            candidates.append(
+                _candidate_trace(
+                    "tool_call",
+                    tool.name,
+                    {},
+                    -1.0,
+                    ["tool disabled"],
+                    _tool_input(tool.name, goal),
+                    capability_contract_for("tool_call", tool.name),
+                )
+            )
             continue
-        breakdown, rejected_reasons = _score_tool(session, tool, goal, goal_type, failed_names, analysis, needs_command_probe)
+        contract = capability_contract_for("tool_call", tool.name)
+        breakdown, rejected_reasons = _score_tool(
+            session,
+            tool,
+            goal,
+            goal_type,
+            failed_names,
+            analysis,
+            needs_command_probe,
+            requirements,
+            missing_requirements,
+            contract,
+        )
         candidates.append(
-            _candidate_trace("tool_call", tool.name, breakdown, sum(breakdown.values()), rejected_reasons, _tool_input(tool.name, goal))
+            _candidate_trace("tool_call", tool.name, breakdown, sum(breakdown.values()), rejected_reasons, _tool_input(tool.name, goal), contract)
         )
 
     viable = [candidate for candidate in candidates if float(candidate["score"]) > 0]
@@ -124,6 +159,7 @@ def select_next_action_with_trace(
                 0.1,
                 ["no enabled matching tool or skill scored above zero"],
                 {"input": goal},
+                capability_contract_for("workflow_run", "simple_chat"),
             )
         )
 
@@ -136,6 +172,7 @@ def select_next_action_with_trace(
             "score": selected.score,
             "reason": selected.reason,
         },
+        "requirements": requirements,
         "candidates": candidates[:8],
     }
     return SelectionResult(selected=selected, trace=trace)
@@ -186,6 +223,9 @@ def _score_skill(
     goal_type: str,
     failed_names: set[str],
     analysis: dict[str, Any],
+    requirements: list[str],
+    missing_requirements: set[str],
+    contract: dict[str, list[str]],
 ) -> tuple[dict[str, float], list[str]]:
     lowered = goal.lower()
     breakdown = _base_breakdown()
@@ -197,6 +237,7 @@ def _score_skill(
         rejected_reasons.append("failed in previous iteration")
     if skill.id in _fallback_skill_ids(lowered):
         breakdown["fallback_match"] = 2.0
+    _apply_requirement_match(breakdown, requirements, missing_requirements, contract)
     for term in _terms(lowered):
         if term and (term in skill.id.lower() or term in skill.description.lower()):
             breakdown["text_match"] += 0.4
@@ -217,6 +258,9 @@ def _score_tool(
     failed_names: set[str],
     analysis: dict[str, Any],
     needs_command_probe: bool,
+    requirements: list[str],
+    missing_requirements: set[str],
+    contract: dict[str, list[str]],
 ) -> tuple[dict[str, float], list[str]]:
     lowered = goal.lower()
     breakdown = _base_breakdown(base=1.5)
@@ -230,6 +274,7 @@ def _score_tool(
         breakdown["fallback_match"] = 1.5
     if needs_command_probe and tool.name == "shell.run":
         breakdown["replan_probe"] = 3.0
+    _apply_requirement_match(breakdown, requirements, missing_requirements, contract)
     for term in _terms(lowered):
         if term and (term in tool.name.lower() or term in tool.description.lower()):
             breakdown["text_match"] += 0.3
@@ -252,6 +297,7 @@ def _base_breakdown(base: float = 2.0) -> dict[str, float]:
         "recent_failure_penalty": 0.0,
         "effectiveness": 0.0,
         "replan_probe": 0.0,
+        "requirement_match": 0.0,
     }
 
 
@@ -309,6 +355,7 @@ def _candidate_trace(
     score: float,
     rejected_reasons: list[str],
     input_data: dict[str, Any],
+    contract: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     return {
         "type": action_type,
@@ -317,6 +364,45 @@ def _candidate_trace(
         "score_breakdown": {key: round(float(value), 4) for key, value in breakdown.items()},
         "rejected_reasons": rejected_reasons,
         "input_data": input_data,
+        "contract": contract or capability_contract_for(action_type, name),
+    }
+
+
+def capability_contract_for(action_type: str, name: str) -> dict[str, list[str]]:
+    if name == "shell.run":
+        return {
+            "evidence_produced": ["command_output", "test_command_evidence"],
+            "verification_hints": ["Use stdout/stderr and exit code as command evidence."],
+            "failure_modes": ["command_failed", "timeout", "goal_incomplete"],
+        }
+    if name == "git.status":
+        return {
+            "evidence_produced": ["workspace_state"],
+            "verification_hints": ["Use git status output as workspace state evidence."],
+            "failure_modes": ["command_failed"],
+        }
+    if action_type == "skill_run" and name == "code.local_task":
+        return {
+            "evidence_produced": ["workspace_state", "command_output"],
+            "verification_hints": ["Use skill workflow outputs as code/workspace evidence."],
+            "failure_modes": ["workflow_failed", "goal_incomplete"],
+        }
+    if action_type == "skill_run" and name == "file.workspace_ops":
+        return {
+            "evidence_produced": ["workspace_listing", "file_evidence"],
+            "verification_hints": ["Use file listing or file content outputs as workspace evidence."],
+            "failure_modes": ["workflow_failed", "file_not_found"],
+        }
+    if name in {"web.search", "web.fetch", "research.report"}:
+        return {
+            "evidence_produced": ["source_or_evidence_explanation"],
+            "verification_hints": ["Use fetched source records and snippets as evidence."],
+            "failure_modes": ["network_failed", "source_missing"],
+        }
+    return {
+        "evidence_produced": ["general_observation"],
+        "verification_hints": ["Use completed non-empty output as general evidence."],
+        "failure_modes": ["action_failed", "goal_incomplete"],
     }
 
 
@@ -363,6 +449,40 @@ def _needs_test_command_probe(goal: str, goal_type: str, previous_observations: 
     if goal_type != "code" or not _contains_any(goal.lower(), ["test", "pytest", "测试"]):
         return False
     return any(observation.get("status") != "completed" for observation in previous_observations)
+
+
+def _requirements_from_analysis(analysis: dict[str, Any]) -> list[str]:
+    rows = analysis.get("requirements", [])
+    if not isinstance(rows, list):
+        return []
+    result: list[str] = []
+    for row in rows:
+        if isinstance(row, dict) and row.get("id"):
+            result.append(str(row["id"]))
+    return result
+
+
+def _missing_requirements(previous_observations: list[dict[str, Any]]) -> set[str]:
+    missing: set[str] = set()
+    for observation in previous_observations:
+        values = observation.get("missing_requirements", [])
+        if isinstance(values, list):
+            missing.update(str(item) for item in values)
+    return missing
+
+
+def _apply_requirement_match(
+    breakdown: dict[str, float],
+    requirements: list[str],
+    missing_requirements: set[str],
+    contract: dict[str, list[str]],
+) -> None:
+    if not missing_requirements:
+        return
+    evidence = set(contract.get("evidence_produced", []))
+    matches = set(requirements).intersection(missing_requirements).intersection(evidence)
+    if matches:
+        breakdown["requirement_match"] = float(len(matches) * 2.5)
 
 
 def _fallback_skill_ids(lowered_goal: str) -> list[str]:

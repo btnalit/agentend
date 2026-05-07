@@ -485,3 +485,115 @@ Verification evidence:
 - `agent-replan --shared-home`, `orchestration-smoke`, `memory-consolidation`, and `long-task-worker` evals passed.
 - A normal `agent run` in the same home after shared-home `agent-replan` completed with `pytest 8.4.2`, proving fixture restoration and selector command probing.
 - `git diff --check`: exit 0; Windows CRLF warnings only.
+
+## 16. Agent Quality Deepening Requirements - O33-O44 - 2026-05-07
+
+Status: planned for immediate implementation.
+
+Scope:
+- Keep the current single-agent architecture.
+- Keep selector rule-scored in the first implementation.
+- Keep memory relation shortlist metadata-driven; do not introduce embeddings in this stage.
+- Do not introduce multi-agent routing, distributed queues, approval systems, or remote sandboxing.
+
+Evaluator requirements:
+- O33: Add a `GoalRequirement` schema that turns goal text and goal analysis into explicit requirements.
+- O34: Add deterministic validators for common requirement types:
+  - `non_empty_observation`
+  - `test_command_evidence`
+  - `source_or_evidence_explanation`
+  - `artifact_or_progress`
+- O35: Add an optional structured evaluator adapter contract that can later call an LLM judge, while default offline behavior remains deterministic.
+- O36: Persist evaluator trace events so evals can grade individual requirements, evidence refs, missing requirements, confidence, and next probes.
+- A test-command goal must not complete from a goal echo; it must complete from concrete evidence such as `pytest`.
+
+Memory requirements:
+- O37: Record `memory_use_events` that link retrieved memories to agent runs, iterations, selected actions, final outcome, and usefulness classification.
+- O38: Add a memory compiler that creates or updates a short project memory digest from high-confidence active memories.
+- O39: Add a memory lint/report surface that flags overlong, duplicate, stale, untagged, superseded, and low-confidence active memories.
+- O40: The project digest must be short, tagged, sourced from `agent_consolidator`, and retrievable like any other project memory.
+
+Tool/skill orchestration requirements:
+- O41: Add a capability contract view for selector candidates, including expected evidence produced, verification hints, and common failure modes.
+- O42: Make selector scoring requirement-aware after a failed or incomplete observation, so capabilities that can produce missing evidence receive a transparent score component.
+- O43: Add eval coverage that asserts capability contracts and requirement-aware replan behavior.
+
+Long task loop requirements:
+- O44: Extend progress artifacts and task resume cursors with structured `done`, `doing`, `next`, `blockers`, `evidence`, `missing_requirements`, and `partial_result` fields.
+- Max-iteration exits should preserve useful partial output and a resume cursor instead of only recording a generic failure.
+- Resume must continue to avoid rerunning completed iterations.
+
+Acceptance:
+- Tests prove the evaluator extracts and grades requirement-level results.
+- Tests prove evaluator trace rows are persisted for AgentRun iterations.
+- Tests prove memory use events are recorded after a run that retrieved memory.
+- Tests prove the memory compiler creates a bounded project digest and lint reports real issues.
+- Tests prove selector traces expose capability contracts and missing-evidence score components.
+- Tests prove progress artifacts and task resume cursors include structured long-task state.
+- New eval suites `goal-satisfaction`, `memory-quality`, and `capability-contracts` pass.
+
+Verification targets:
+```bash
+.venv\Scripts\python.exe -m pytest tests\test_agent_goal_evaluator.py tests\test_agent_memory_quality.py tests\test_agent_capability_contracts.py tests\test_agent_long_task_state.py -q --basetemp=.tmp\agent-quality-red -p no:cacheprovider
+.venv\Scripts\python.exe -m pytest tests\test_agent_run_controller.py tests\test_agent_tool_first_selector.py tests\test_agent_selector_trace.py tests\test_agent_memory_consolidator.py tests\test_agent_memory_relation.py tests\test_agent_effectiveness.py tests\test_agent_worker.py tests\test_agent_orchestration_eval.py tests\test_agent_db_init_stability.py -q --basetemp=.tmp\agent-quality-related -p no:cacheprovider
+.venv\Scripts\python.exe -m pytest tests -q --basetemp=.tmp\agent-quality-full -p no:cacheprovider
+.venv\Scripts\python.exe -m compileall -q src tests
+.venv\Scripts\agentend.exe eval run goal-satisfaction --home .tmp\agent-quality-home
+.venv\Scripts\agentend.exe eval run memory-quality --home .tmp\agent-quality-home
+.venv\Scripts\agentend.exe eval run capability-contracts --home .tmp\agent-quality-home
+git diff --check
+```
+
+## 17. Agent Quality Deepening Implementation Backfill - O33-O44 - 2026-05-07
+
+Status: implemented and verified.
+
+Implemented acceptance scope:
+- AgentRun now derives explicit `GoalRequirement` rows from goal analysis before each action.
+- Requirement-level deterministic evaluation replaces the previous broad non-empty success gate for covered goal types.
+- Test-command goals require concrete command evidence such as `pytest`, `python -m pytest`, `unittest`, `tox`, `py.test`, or `nox`.
+- Goal echo and generic output no longer satisfy test-command evidence.
+- Per-iteration evaluator traces are persisted in `agent_evaluation_events`.
+- Retrieved memory ids in iteration plans are converted into `memory_use_events` after the run reaches a terminal state.
+- Project/user memory can be compiled into one bounded `memory-digest` item and checked by a non-mutating lint report.
+- Selector traces expose capability contracts and transparent `requirement_match` score components.
+- Long-task progress artifacts and task resume cursors carry structured progress, partial result, missing requirements, and resume cursor data.
+- New CLI surfaces `agentend memory digest` and `agentend memory lint` are available for memory quality operations.
+
+Verification evidence:
+- Focused O33-O44 tests: 9 passed.
+- Related orchestration tests: 39 passed.
+- Full suite: 161 passed.
+- Compileall: passed.
+- Eval `goal-satisfaction`: passed.
+- Eval `memory-quality`: passed.
+- Eval `capability-contracts`: passed.
+- Eval `orchestration-smoke`: passed.
+- Eval `memory-consolidation`: passed.
+- Eval `long-task-worker`: passed.
+- CLI smoke for `memory digest` and `memory lint`: passed.
+
+Out of scope remains unchanged:
+- No embeddings.
+- No multi-agent routing.
+- No distributed queue.
+- No approval/security workflow.
+- No default semantic LLM judge.
+
+## 18. Agent Quality Deepening Closeout Requirements - 2026-05-07
+
+Status: implemented and verified.
+
+Additional closeout requirements:
+- Resume must reconstruct selector observations with `missing_requirements`, not only `status=incomplete`.
+- Test-command evidence must ignore plain goal/task/request echo lines, even when the goal itself contains `pytest`.
+- Memory search must keep Unicode terms, avoid all-memory results for empty/stopword-only queries, and respect scope in FTS-backed candidate search.
+- Memory use feedback for the same AgentRun must reflect the latest terminal run status after resume.
+- HTTP fixture tests must consume POST bodies so cache/policy tests are deterministic.
+
+Verification evidence:
+- Focused closeout tests: 9 passed.
+- Related orchestration tests: 43 passed.
+- Full suite: 165 passed.
+- Compileall: passed.
+- Eval and memory CLI smoke commands passed.

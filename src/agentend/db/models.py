@@ -72,6 +72,23 @@ class AgentIteration(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
+class AgentEvaluationEvent(Base):
+    __tablename__ = "agent_evaluation_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    agent_run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id"), nullable=False, index=True)
+    iteration_id: Mapped[str] = mapped_column(ForeignKey("agent_iterations.id"), nullable=False, index=True)
+    goal_type: Mapped[str] = mapped_column(String(64), default="general", nullable=False, index=True)
+    complete: Mapped[str] = mapped_column(String(8), default="false", nullable=False, index=True)
+    confidence: Mapped[str] = mapped_column(String(16), default="0.0", nullable=False)
+    requirements_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    satisfied_requirements_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    missing_requirements_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    evidence_refs_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    next_probe: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class Message(Base):
     __tablename__ = "messages"
 
@@ -384,6 +401,20 @@ class MemoryRetrieval(Base):
     memory_id: Mapped[str] = mapped_column(ForeignKey("memory_items.id"), nullable=False, index=True)
     run_id: Mapped[str | None] = mapped_column(ForeignKey("runs.id"), nullable=True, index=True)
     query: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class MemoryUseEvent(Base):
+    __tablename__ = "memory_use_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    memory_id: Mapped[str] = mapped_column(ForeignKey("memory_items.id"), nullable=False, index=True)
+    agent_run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id"), nullable=False, index=True)
+    iteration_id: Mapped[str | None] = mapped_column(ForeignKey("agent_iterations.id"), nullable=True, index=True)
+    query: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    selected_action: Mapped[str] = mapped_column(String(255), default="", nullable=False, index=True)
+    run_status: Mapped[str] = mapped_column(String(32), default="unknown", nullable=False, index=True)
+    outcome: Mapped[str] = mapped_column(String(32), default="unknown", nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 

@@ -30,6 +30,7 @@ from agentend.core.memory_consolidator import (
     extract_memory_candidates,
     memory_candidate_to_dict,
 )
+from agentend.core.memory_quality import compile_project_memory_digest, lint_memory_items
 from agentend.core.memory_store import edit_memory_item, forget_memory_item, search_memory_items, write_memory_item
 from agentend.core.model_routing import list_routes, set_budget, set_route
 from agentend.core.profile import load_agent_profile
@@ -1130,6 +1131,41 @@ def memory_consolidate(
         )
         for memory_id in result.memory_ids:
             typer.echo(f"Memory: {memory_id}")
+
+
+@memory_app.command("digest")
+def memory_digest(
+    max_items: int = typer.Option(12, "--max-items", min=1, help="Maximum source memories to include."),
+    max_chars: int = typer.Option(1200, "--max-chars", min=120, help="Maximum digest content length."),
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Compile or update the project memory digest."""
+    resolved_home = home or Path.cwd()
+    init_database(resolved_home)
+    with session_scope(resolved_home) as session:
+        digest = compile_project_memory_digest(session, max_items=max_items, max_chars=max_chars)
+        payload = {
+            "id": digest.id,
+            "scope": digest.scope,
+            "source": digest.source,
+            "confidence": digest.confidence,
+            "tags": json.loads(digest.tags_json),
+            "content": digest.content,
+        }
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+@memory_app.command("lint")
+def memory_lint(
+    max_content_chars: int = typer.Option(1200, "--max-content-chars", min=120, help="Maximum active memory content length."),
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+) -> None:
+    """Report memory quality issues."""
+    resolved_home = home or Path.cwd()
+    init_database(resolved_home)
+    with session_scope(resolved_home) as session:
+        issues = lint_memory_items(session, max_content_chars=max_content_chars)
+        typer.echo(json.dumps(issues, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 @memory_app.command("edit")

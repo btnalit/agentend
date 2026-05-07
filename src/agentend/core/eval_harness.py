@@ -20,11 +20,13 @@ from sqlalchemy.orm import Session
 from agentend.config import load_config
 from agentend.core.agent_run import AgentRunController
 from agentend.core.agent_selector import select_next_action
+from agentend.core.agent_evaluator import evaluate_goal_observation, infer_goal_requirements
 from agentend.core.evidence import evidence_manifest_for_run
 from agentend.core.errors import classify_exception
 from agentend.core.effectiveness import effectiveness_for, record_effectiveness_event
 from agentend.core.llm_router import LLMRouter
 from agentend.core.memory_consolidator import consolidate_memory_candidates
+from agentend.core.memory_quality import compile_project_memory_digest, lint_memory_items
 from agentend.core.memory_store import write_memory_item
 from agentend.core.model_routing import set_route
 from agentend.core.skills import ensure_builtin_skills, load_skill_bundle
@@ -38,6 +40,7 @@ from agentend.core.workflow_schema import load_workflow_yaml
 from agentend.db.models import (
     ActionPolicyDecision,
     AgentIteration,
+    AgentEvaluationEvent,
     AgentRun,
     Artifact,
     Conversation,
@@ -51,6 +54,7 @@ from agentend.db.models import (
     EvidenceLink,
     MemoryCandidate,
     MemoryItem,
+    MemoryUseEvent,
     MemoryRetrieval,
     ResultCache,
     Run,
@@ -84,6 +88,9 @@ EVAL_SUITES = (
     "skill-effectiveness",
     "long-task-worker",
     "agent-replan",
+    "goal-satisfaction",
+    "memory-quality",
+    "capability-contracts",
 )
 PNG_1X1 = bytes.fromhex(
     "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
@@ -135,6 +142,12 @@ def run_eval_suite(
         payload = _run_long_task_worker_suite(home)
     elif suite == "agent-replan":
         payload = _run_agent_replan_suite(home)
+    elif suite == "goal-satisfaction":
+        payload = _run_goal_satisfaction_suite(home)
+    elif suite == "memory-quality":
+        payload = _run_memory_quality_suite(home)
+    elif suite == "capability-contracts":
+        payload = _run_capability_contracts_suite(home)
     else:
         raise ValueError(f"Unknown eval suite: {suite}")
 
@@ -187,6 +200,138 @@ def _run_orchestration_smoke_suite(home: Path) -> dict[str, object]:
             )
         ]
     return _suite_payload("orchestration-smoke", cases)
+
+
+def _run_goal_satisfaction_suite(home: Path) -> dict[str, object]:
+    goal = "List the project test command and explain evidence."
+    requirements = infer_goal_requirements(goal, {})
+    echo_eval = evaluate_goal_observation(
+        goal,
+        {"status": "completed", "output": "Goal: List the project test command and explain evidence.\nPython 3.13.7"},
+        iteration_index=1,
+        max_iterations=1,
+    )
+    pytest_goal_echo_eval = evaluate_goal_observation(
+        "Run pytest and report evidence.",
+        {"status": "completed", "output": "Goal: Run pytest and report evidence.\nNo command executed."},
+        iteration_index=1,
+        max_iterations=1,
+    )
+    pytest_eval = evaluate_goal_observation(
+        goal,
+        {"status": "completed", "output": '{"stdout": "pytest 8.4.2\\n"}'},
+        iteration_index=1,
+        max_iterations=1,
+    )
+    run_result = AgentRunController(home).run(goal, channel="eval", external_user_id="goal-satisfaction", max_iterations=2)
+    with session_scope(home) as session:
+        events = (
+            session.execute(select(AgentEvaluationEvent).where(AgentEvaluationEvent.agent_run_id == run_result.agent_run_id))
+            .scalars()
+            .all()
+        )
+    cases = [
+        _case(
+            "requirement-level-goal-grading",
+            {
+                "requirements": [requirement.to_dict() for requirement in requirements],
+                "echo_eval": echo_eval,
+                "pytest_goal_echo_eval": pytest_goal_echo_eval,
+                "pytest_eval": pytest_eval,
+                "agent_run_id": run_result.agent_run_id,
+                "event_count": len(events),
+            },
+            [
+                _assertion("test requirement inferred", any(req.id == "test_command_evidence" for req in requirements)),
+                _assertion("goal echo is incomplete", echo_eval["complete"] is False),
+                _assertion("pytest goal echo is incomplete", pytest_goal_echo_eval["complete"] is False),
+                _assertion("pytest output completes", pytest_eval["complete"] is True),
+                _assertion("evaluation events persisted", len(events) >= 1),
+            ],
+        )
+    ]
+    return _suite_payload("goal-satisfaction", cases)
+
+
+def _run_memory_quality_suite(home: Path) -> dict[str, object]:
+    with session_scope(home) as session:
+        write_memory_item(
+            session,
+            home,
+            content="list project test command explain evidence pytest python -m pytest",
+            scope="project",
+            source="agent_consolidator",
+            confidence="0.95",
+            tags=["subject:test-command", "type:procedure"],
+        )
+    run_result = AgentRunController(home).run(
+        "List project test command and explain evidence.",
+        channel="eval",
+        external_user_id="memory-quality",
+        max_iterations=2,
+    )
+    with session_scope(home) as session:
+        digest = compile_project_memory_digest(session)
+        issues = lint_memory_items(session)
+        events = (
+            session.execute(select(MemoryUseEvent).where(MemoryUseEvent.agent_run_id == run_result.agent_run_id))
+            .scalars()
+            .all()
+        )
+        cases = [
+            _case(
+                "memory-feedback-digest-and-lint",
+                {
+                    "agent_run_id": run_result.agent_run_id,
+                    "digest_id": digest.id,
+                    "issue_count": len(issues),
+                    "memory_use_count": len(events),
+                },
+                [
+                    _assertion("memory use event recorded", bool(events)),
+                    _assertion("digest is active", digest.status == "active" and "memory-digest" in _json_or_empty_list(digest.tags_json)),
+                    _assertion("lint returns a report", isinstance(issues, list)),
+                ],
+            )
+        ]
+    return _suite_payload("memory-quality", cases)
+
+
+def _run_capability_contracts_suite(home: Path) -> dict[str, object]:
+    with session_scope(home) as session:
+        result = select_next_action(
+            home,
+            session,
+            "List the project test command and explain evidence.",
+            {
+                "candidate_skills": ["code.local_task"],
+                "candidate_tools": ["shell.run", "git.status"],
+                "requirements": [
+                    {
+                        "id": "test_command_evidence",
+                        "kind": "test_command_evidence",
+                        "description": "Show concrete test command evidence.",
+                        "required": True,
+                        "evidence_hint": "pytest",
+                    }
+                ],
+            },
+            [{"action_name": "code.local_task", "status": "incomplete", "missing_requirements": ["test_command_evidence"]}],
+        )
+        cases = [
+            _case(
+                "requirement-aware-contract-selection",
+                {"selected_action": result.to_dict()},
+                [
+                    _assertion("shell run selected for missing evidence", result.name == "shell.run"),
+                    _assertion(
+                        "requirement match is visible",
+                        bool(result.score_breakdown and result.score_breakdown.get("requirement_match", 0) > 0),
+                    ),
+                ],
+            )
+        ]
+    return _suite_payload("capability-contracts", cases)
 
 
 def _run_tool_first_suite(home: Path) -> dict[str, object]:
@@ -1776,3 +1921,11 @@ def _json_or_empty(value: str) -> dict[str, object]:
     except json.JSONDecodeError:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _json_or_empty_list(value: str) -> list[str]:
+    try:
+        payload = json.loads(value or "[]")
+    except json.JSONDecodeError:
+        return []
+    return [str(item) for item in payload] if isinstance(payload, list) else []

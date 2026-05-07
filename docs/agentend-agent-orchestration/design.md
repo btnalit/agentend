@@ -870,3 +870,140 @@ Behavioral notes:
 - `status=completed` and non-empty output remain necessary but are no longer sufficient for simple goal-specific cases.
 - The current evaluator is intentionally rule-based and narrow; it is not a broad semantic judge.
 - The command probe is activated only after a prior failed/incomplete observation, so initial selection remains compatible with the existing selector calibration.
+
+## 24. Agent Quality Deepening Design - O33-O44 - 2026-05-07
+
+Architecture stance:
+- Keep `AgentRunController` as the outer loop owner.
+- Keep `WorkflowRunner` as a reusable execution substrate, not an agent.
+- Add focused modules beside the controller instead of growing the controller into a catch-all:
+  - `agent_evaluator.py`
+  - `memory_quality.py`
+  - selector-side capability contract helpers
+
+Evaluator design:
+- `GoalRequirement` is a small structured object:
+  - `id`
+  - `kind`
+  - `description`
+  - `required`
+  - `evidence_hint`
+- `infer_goal_requirements(goal, goal_analysis)` produces deterministic requirements.
+- `evaluate_goal_observation(...)` returns:
+  - `complete`
+  - `confidence`
+  - `requirements`
+  - `satisfied_requirements`
+  - `missing_requirements`
+  - `evidence_refs`
+  - `next_probe`
+  - `goal_type`
+  - `remaining_iterations`
+- Deterministic validators run first and are authoritative in offline mode.
+- A structured judge adapter is represented as an interface-shaped function that can later call an LLM and return schema-compatible additions. It does not change default behavior in this slice.
+- `AgentEvaluationEvent` persists evaluator trace rows for debugging and eval grading.
+
+Memory quality design:
+- `MemoryUseEvent` records that a memory was available to an AgentRun and whether the final run outcome suggests the memory helped, was unused, or was not enough.
+- Existing `MemoryRetrieval` remains a low-level retrieval log. `MemoryUseEvent` is the higher-level run outcome feedback.
+- `compile_project_memory_digest(session, limit=N)` reads active project/user memories, excludes old digest memories, and creates or updates one active digest memory with:
+  - source `agent_consolidator`
+  - tags `memory-digest`, `compiled`, `scope:project`
+  - bounded content length
+- `lint_memory_items(session)` returns issue dicts rather than mutating memory. CLI/eval can present the report without changing stored memory.
+
+Capability contract design:
+- Selector candidate traces gain a `contract` object:
+```json
+{
+  "evidence_produced": ["test_command_evidence"],
+  "verification_hints": ["Use stdout/stderr exit code as evidence"],
+  "failure_modes": ["command_failed", "goal_incomplete"]
+}
+```
+- The contract is derived from tool/skill/workflow metadata and local rules.
+- Requirement-aware scoring stays conservative:
+  - first iteration remains mostly existing tool-first scoring.
+  - after a failed or incomplete observation, missing requirements produce a transparent `requirement_match` score for capabilities that can produce the missing evidence.
+
+Long-task state design:
+- Progress artifacts gain a stable `progress` envelope:
+```json
+{
+  "done": ["iteration 1 recorded"],
+  "doing": "evaluate selected action",
+  "next": "finish or replan",
+  "blockers": [],
+  "evidence": ["pytest"],
+  "goal_state": {
+    "satisfied_requirements": ["non_empty_observation"],
+    "missing_requirements": []
+  }
+}
+```
+- Failed/max-iteration final results include `partial_result`, `missing_requirements`, and `resume_cursor`.
+- Worker task `resume_cursor_json` mirrors these fields so long tasks can be resumed or inspected without opening raw iteration rows.
+
+Eval design:
+- `goal-satisfaction` evaluates deterministic requirement extraction and fake-observation grading.
+- `memory-quality` evaluates memory use events, digest compilation, and lint reporting.
+- `capability-contracts` evaluates selector contract exposure and missing-evidence replan scoring.
+
+Compatibility:
+- Existing `evaluation_json` remains a JSON object and gains additional keys; readers that only use `complete` keep working.
+- Existing memory retrieval and consolidation behavior remains intact.
+- Existing eval suites continue to run.
+
+## 25. Agent Quality Deepening Implementation Backfill - O33-O44 - 2026-05-07
+
+Code mapping:
+- `src/agentend/core/agent_evaluator.py`
+  - Owns `GoalRequirement`, deterministic requirement inference, observation evaluation, and the structured evaluator adapter seam.
+  - Keeps deterministic validation as the default authority.
+- `src/agentend/core/goal_analyzer.py`
+  - Adds inferred requirement objects to the goal analysis payload.
+- `src/agentend/core/agent_run.py`
+  - Calls the evaluator, persists `AgentEvaluationEvent`, stores requirement fields in final results, records memory use events, writes progress envelopes, and creates resume cursors for max-iteration exits.
+- `src/agentend/core/agent_selector.py`
+  - Adds `capability_contract_for(...)`, emits contracts into traces, and applies `requirement_match` after missing requirements appear in prior observations.
+- `src/agentend/core/memory_quality.py`
+  - Provides digest compilation and lint/report functions.
+- `src/agentend/core/memory_store.py`
+  - Filters common English stopwords from FTS queries so memory retrieval is less brittle for natural-language goals.
+- `src/agentend/core/worker.py`
+  - Mirrors AgentRun long-task state into task `resume_cursor_json`.
+- `src/agentend/core/eval_harness.py`
+  - Adds `goal-satisfaction`, `memory-quality`, and `capability-contracts`.
+- `src/agentend/cli.py`
+  - Adds `agentend memory digest` and `agentend memory lint`.
+- `src/agentend/db/models.py`
+  - Adds `AgentEvaluationEvent` and `MemoryUseEvent`.
+
+Behavioral notes:
+- `non_empty_observation` remains a required completion floor, but it is not counted as evidence.
+- Optional `source_or_evidence_explanation` requires concrete markers such as `evidence:`, `source:`, `stdout`, `stderr`, or `exit_code`; goal text echo is not treated as evidence.
+- Requirement-aware selector scoring is only activated after previous failed or incomplete observations, preserving existing first-iteration scoring.
+- Memory use outcome is classified from terminal run status. It is useful for ranking and diagnostics, but not proof that a memory causally caused success.
+
+Validation mapping:
+- Goal satisfaction is covered by `tests/test_agent_goal_evaluator.py` and eval `goal-satisfaction`.
+- Memory quality is covered by `tests/test_agent_memory_quality.py` and eval `memory-quality`.
+- Capability contracts are covered by `tests/test_agent_capability_contracts.py` and eval `capability-contracts`.
+- Long-task state is covered by `tests/test_agent_long_task_state.py`.
+
+## 26. Agent Quality Deepening Closeout Design Notes - 2026-05-07
+
+Closeout adjustments:
+- Resume reconstruction now copies `missing_requirements` from persisted iteration evaluation into selector observations. This keeps requirement-aware selector scoring consistent across same-run replans and resumed runs.
+- Test evidence detection strips operator echo lines with `Goal:`, `Task:`, and `Request:` prefixes before checking markers such as `pytest`.
+- Memory query parsing uses Unicode word terms, filters English stopwords, rejects empty fallback queries, falls back when FTS has no rows, and applies scope when loading FTS result rows.
+- Memory use event recording remains per iteration, but existing rows are updated to the current AgentRun terminal status/outcome when a failed run later resumes successfully.
+- The HTTP test fixture consumes POST request bodies before response so repeated POST requests on reused connections remain valid.
+
+Regression mapping:
+- `tests/test_agent_run_controller.py::test_resume_reconstructed_observations_preserve_missing_requirements`
+- `tests/test_agent_goal_evaluator.py::test_goal_requirements_and_deterministic_evaluation`
+- `tests/test_agent_memory_quality.py::test_memory_use_event_updates_after_resume_success`
+- `tests/test_agent_memory_quality.py::test_memory_search_keeps_unicode_terms_after_stopword_filter`
+- `tests/test_agent_memory_quality.py::test_memory_candidate_search_respects_scope_when_fts_matches`
+- `tests/test_phase_c_local_action_tools.py::test_http_request_dynamic_side_effect_controls_policy_and_cache`

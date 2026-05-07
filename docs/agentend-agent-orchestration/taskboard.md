@@ -452,6 +452,93 @@ agentend eval run long-task-worker
 git diff --check
 ```
 
+## 18. O33-O44 Completion - 2026-05-07
+
+| Task | Status | Evidence |
+| --- | --- | --- |
+| O33 GoalRequirement schema | Done | Goal analysis now carries stable requirement objects with ids, kinds, required flags, and evidence hints. |
+| O34 Deterministic evaluator registry | Done | Test-command goals require concrete test evidence; goal echo and generic non-empty output remain incomplete. |
+| O35 Structured evaluator adapter contract | Done | `structured_evaluator_adapter()` provides a schema-compatible seam while offline deterministic judging remains default. |
+| O36 Evaluator trace persistence and eval | Done | Each AgentRun iteration writes `agent_evaluation_events`; eval `goal-satisfaction` passed. |
+| O37 Memory use events | Done | Retrieved memories are linked to AgentRuns through `memory_use_events` with selected action, status, and outcome. |
+| O38 Memory compiler | Done | `compile_project_memory_digest()` creates or updates one bounded project digest memory. |
+| O39 Memory lint/report | Done | `lint_memory_items()` and `agentend memory lint` report quality issues without mutating memory. |
+| O40 Project memory digest retrieval | Done | Digest memories are tagged, synced to FTS, and retrievable through normal memory search. |
+| O41 Capability contract v2 trace | Done | Selector candidate traces include evidence produced, verification hints, and failure modes. |
+| O42 Requirement-aware selector scoring | Done | Missing `test_command_evidence` adds a visible `requirement_match` boost for `shell.run` after incomplete observations. |
+| O43 Capability contract eval | Done | Eval `capability-contracts` passed. |
+| O44 Long-task state envelope | Done | Progress artifacts and worker task resume cursors now include structured progress, partial result, missing requirements, and resume cursor data. |
+
+Verification results:
+- Initial O33-O44 red run failed as expected on missing `agent_evaluator`, `memory_quality`, and selector contract exports.
+- Focused O33-O44 tests: 9 passed.
+- Related orchestration tests: 39 passed.
+- Full suite: 161 passed.
+- Compileall: passed.
+- Eval `goal-satisfaction`: passed.
+- Eval `memory-quality`: passed.
+- Eval `capability-contracts`: passed.
+- Eval `orchestration-smoke`: passed.
+- Eval `memory-consolidation`: passed.
+- Eval `long-task-worker`: passed.
+- CLI smoke `agentend memory digest --home .tmp\agent-quality-home --max-items 6`: passed.
+- CLI smoke `agentend memory lint --home .tmp\agent-quality-home`: passed.
+
+Verification commands:
+```bash
+.venv\Scripts\python.exe -m pytest tests\test_agent_goal_evaluator.py tests\test_agent_memory_quality.py tests\test_agent_capability_contracts.py tests\test_agent_long_task_state.py -q --basetemp=.tmp\agent-quality-green -p no:cacheprovider
+.venv\Scripts\python.exe -m pytest tests\test_agent_run_controller.py tests\test_agent_tool_first_selector.py tests\test_agent_selector_trace.py tests\test_agent_memory_consolidator.py tests\test_agent_memory_relation.py tests\test_agent_effectiveness.py tests\test_agent_worker.py tests\test_agent_orchestration_eval.py tests\test_agent_db_init_stability.py tests\test_agent_goal_evaluator.py tests\test_agent_memory_quality.py tests\test_agent_capability_contracts.py tests\test_agent_long_task_state.py -q --basetemp=.tmp\agent-quality-related -p no:cacheprovider
+.venv\Scripts\python.exe -m pytest tests -q --basetemp=.tmp\agent-quality-full -p no:cacheprovider
+.venv\Scripts\python.exe -m compileall -q src tests
+.venv\Scripts\agentend.exe eval run goal-satisfaction --home .tmp\agent-quality-home
+.venv\Scripts\agentend.exe eval run memory-quality --home .tmp\agent-quality-home
+.venv\Scripts\agentend.exe eval run capability-contracts --home .tmp\agent-quality-home
+.venv\Scripts\agentend.exe eval run orchestration-smoke --home .tmp\agent-quality-home
+.venv\Scripts\agentend.exe eval run memory-consolidation --home .tmp\agent-quality-home
+.venv\Scripts\agentend.exe eval run long-task-worker --home .tmp\agent-quality-home
+.venv\Scripts\agentend.exe memory digest --home .tmp\agent-quality-home --max-items 6
+.venv\Scripts\agentend.exe memory lint --home .tmp\agent-quality-home
+```
+
+Residual risks:
+- The structured LLM evaluator is still only an adapter seam; no default LLM judge is enabled.
+- Memory usefulness is outcome-correlated feedback, not causal attribution.
+- Memory digest compilation is deliberately conservative and short; it does not replace relation classification or candidate consolidation.
+- Worker remains single-concurrency by design in this stage.
+
+## 19. O33-O44 Commit Closeout - 2026-05-07
+
+| Closeout check | Status | Evidence |
+| --- | --- | --- |
+| Resume selector state preserves missing requirements | Done | Added regression for failed-then-resumed AgentRun; second iteration plan keeps `missing_requirements` and `shell.run` receives `requirement_match`. |
+| Goal echo is not test evidence | Done | Evaluator strips `Goal:`, `Task:`, and `Request:` lines before checking test evidence; pytest goal echo remains incomplete. |
+| Memory search Unicode/scope behavior | Done | Added Unicode memory search regression and scoped candidate search regression. |
+| Memory use events after resume | Done | Existing failed-run memory use events update to final completed/helped outcome after resume. |
+| HTTP fixture stability | Done | POST body is consumed before response, removing connection-reuse flake. |
+
+Closeout verification commands:
+```bash
+.venv\Scripts\python.exe -m pytest tests\test_agent_goal_evaluator.py tests\test_agent_memory_quality.py tests\test_agent_run_controller.py::test_resume_reconstructed_observations_preserve_missing_requirements tests\test_agent_orchestration_eval.py::test_agent_orchestration_eval_suites_are_listed_and_runnable -q --basetemp=.tmp\agent-closeout-focused4 -p no:cacheprovider
+.venv\Scripts\python.exe -m pytest tests\test_agent_run_controller.py tests\test_agent_tool_first_selector.py tests\test_agent_selector_trace.py tests\test_agent_memory_consolidator.py tests\test_agent_memory_relation.py tests\test_agent_effectiveness.py tests\test_agent_worker.py tests\test_agent_orchestration_eval.py tests\test_agent_db_init_stability.py tests\test_agent_goal_evaluator.py tests\test_agent_memory_quality.py tests\test_agent_capability_contracts.py tests\test_agent_long_task_state.py -q --basetemp=.tmp\agent-closeout-related -p no:cacheprovider
+.venv\Scripts\python.exe -m pytest tests -q --basetemp=.tmp\agent-closeout-full2 -p no:cacheprovider
+.venv\Scripts\python.exe -m compileall -q src tests
+.venv\Scripts\agentend.exe eval run goal-satisfaction --home .tmp\agent-closeout-home
+.venv\Scripts\agentend.exe eval run memory-quality --home .tmp\agent-closeout-home
+.venv\Scripts\agentend.exe eval run capability-contracts --home .tmp\agent-closeout-home
+.venv\Scripts\agentend.exe eval run orchestration-smoke --home .tmp\agent-closeout-home
+.venv\Scripts\agentend.exe eval run memory-consolidation --home .tmp\agent-closeout-home
+.venv\Scripts\agentend.exe eval run long-task-worker --home .tmp\agent-closeout-home
+.venv\Scripts\agentend.exe memory digest --home .tmp\agent-closeout-home --max-items 6
+.venv\Scripts\agentend.exe memory lint --home .tmp\agent-closeout-home
+```
+
+Results:
+- Focused closeout tests: 9 passed.
+- Related orchestration tests: 43 passed.
+- Full suite: 165 passed.
+- Compileall: passed.
+- Six eval/CLI smoke commands above passed.
+
 ## 5. 首版完成定义
 
 - `agentend agent run` 可完成一个工具优先的真实本地任务。
@@ -802,3 +889,115 @@ Results:
 - `agent-replan --shared-home`, `orchestration-smoke`, `memory-consolidation`, and `long-task-worker` evals passed.
 - Normal `agent run` after shared-home `agent-replan` completed with `pytest 8.4.2` output and did not hit the missing fixture.
 - `git diff --check`: exit 0 with CRLF warnings only.
+
+## 16. Agent Quality Deepening Tasks - O33-O44 - 2026-05-07
+
+### O33 GoalRequirement schema `AFK`
+
+Goal: make goal satisfaction criteria explicit before action execution.
+
+Acceptance:
+- Goal analysis includes requirement objects.
+- Requirements have stable ids, kind, description, required flag, and evidence hints.
+- Test-command goals include `test_command_evidence`.
+
+### O34 Deterministic evaluator registry `AFK`
+
+Goal: replace ad hoc evaluator checks with reusable requirement validators.
+
+Acceptance:
+- Validators return satisfied/missing requirement ids.
+- Goal echo without concrete test evidence remains incomplete.
+- Pytest output completes a test-command goal.
+
+### O35 Structured evaluator adapter contract `AFK`
+
+Goal: leave a clean seam for future structured LLM judging without making offline tests depend on an LLM.
+
+Acceptance:
+- The adapter returns schema-compatible decisions.
+- Default behavior is deterministic when no judge is configured.
+
+### O36 Evaluator trace persistence and eval `AFK`
+
+Goal: persist trace-gradeable evaluator events.
+
+Acceptance:
+- Each AgentRun iteration writes one `agent_evaluation_events` row.
+- Eval `goal-satisfaction` proves requirement-level grading.
+
+### O37 Memory use events `AFK`
+
+Goal: track whether retrieved memories were available to and useful for an AgentRun.
+
+Acceptance:
+- Runs that retrieve memory create `memory_use_events`.
+- Events include memory id, agent run id, selected action, run status, and outcome.
+
+### O38 Memory compiler `AFK`
+
+Goal: compile high-confidence project memories into a short digest.
+
+Acceptance:
+- Compiler creates or updates one active project digest memory.
+- Digest excludes old digest memories and is bounded in length.
+
+### O39 Memory lint/report `AFK`
+
+Goal: expose memory hygiene issues without mutating memory.
+
+Acceptance:
+- Lint reports overlong, duplicate, stale, untagged, superseded, and low-confidence active memory issues.
+
+### O40 Project memory digest retrieval `AFK`
+
+Goal: make compiled memory digest available through the normal retrieval path.
+
+Acceptance:
+- Digest is tagged `memory-digest` and `compiled`.
+- Digest appears in project memory search when relevant.
+
+### O41 Capability contract v2 trace `AFK`
+
+Goal: make selector candidate evidence behavior inspectable.
+
+Acceptance:
+- Candidate traces include `contract.evidence_produced`, `verification_hints`, and `failure_modes`.
+
+### O42 Requirement-aware selector scoring `AFK`
+
+Goal: use missing requirements to bias replans toward evidence-producing tools.
+
+Acceptance:
+- Missing `test_command_evidence` gives `shell.run` a visible `requirement_match` score after an incomplete observation.
+- First-iteration behavior remains compatible with current `agent-replan` eval.
+
+### O43 Capability contract eval `AFK`
+
+Goal: add regression coverage for selector contracts and requirement-aware replans.
+
+Acceptance:
+- Eval `capability-contracts` passes and reports selected candidate contracts.
+
+### O44 Long-task state envelope `AFK`
+
+Goal: make progress artifacts and task resume cursors useful for long task continuation.
+
+Acceptance:
+- Progress artifacts include `progress.done`, `doing`, `next`, `blockers`, `evidence`, and `goal_state`.
+- Max-iteration final results include `partial_result`, `missing_requirements`, and `resume_cursor`.
+- Worker task resume cursor mirrors final missing requirement and partial result state.
+
+## 17. O33-O44 Pre-Implementation Checklist - 2026-05-07
+
+Planned verification:
+```bash
+.venv\Scripts\python.exe -m pytest tests\test_agent_goal_evaluator.py tests\test_agent_memory_quality.py tests\test_agent_capability_contracts.py tests\test_agent_long_task_state.py -q --basetemp=.tmp\agent-quality-red -p no:cacheprovider
+.venv\Scripts\python.exe -m pytest tests\test_agent_run_controller.py tests\test_agent_tool_first_selector.py tests\test_agent_selector_trace.py tests\test_agent_memory_consolidator.py tests\test_agent_memory_relation.py tests\test_agent_effectiveness.py tests\test_agent_worker.py tests\test_agent_orchestration_eval.py tests\test_agent_db_init_stability.py -q --basetemp=.tmp\agent-quality-related -p no:cacheprovider
+.venv\Scripts\python.exe -m pytest tests -q --basetemp=.tmp\agent-quality-full -p no:cacheprovider
+.venv\Scripts\python.exe -m compileall -q src tests
+.venv\Scripts\agentend.exe eval run goal-satisfaction --home .tmp\agent-quality-home
+.venv\Scripts\agentend.exe eval run memory-quality --home .tmp\agent-quality-home
+.venv\Scripts\agentend.exe eval run capability-contracts --home .tmp\agent-quality-home
+git diff --check
+```

@@ -11,6 +11,7 @@ from uuid import uuid4
 from sqlalchemy import select
 
 from agentend.config import load_config
+from agentend.core.agent_evaluator import evaluate_goal_observation
 from agentend.core.agent_selector import SelectedAction, select_next_action_with_trace
 from agentend.core.effectiveness import record_effectiveness_event
 from agentend.core.goal_analyzer import analyze_goal
@@ -23,6 +24,7 @@ from agentend.core.workflow_runner import WorkflowRunFailed, WorkflowRunner
 from agentend.core.workflow_schema import load_workflow_yaml
 from agentend.db.models import (
     AgentIteration,
+    AgentEvaluationEvent,
     AgentRun,
     Artifact,
     Checkpoint,
@@ -31,6 +33,7 @@ from agentend.db.models import (
     RunStep,
     Skill,
     ToolCall,
+    MemoryUseEvent,
     utc_now,
 )
 from agentend.db.session import init_database, session_scope
@@ -193,11 +196,12 @@ class AgentRunController:
                 iteration_id=iteration_id,
             )
             duration_ms = int((perf_counter() - started) * 1000)
-            evaluation = self._evaluate_observation(request.goal, observation, iteration_index, max_iteration_index)
+            evaluation = self._evaluate_observation(request.goal, goal_analysis, observation, iteration_index, max_iteration_index)
             selector_observation = observation | {"action_name": selected.name}
             if not evaluation["complete"]:
                 selector_observation["status"] = "incomplete"
                 selector_observation["error_code"] = observation.get("error_code") or "goal_incomplete"
+                selector_observation["missing_requirements"] = evaluation.get("missing_requirements", [])
             previous_observations.append(selector_observation)
 
             with session_scope(self.home) as session:
@@ -215,6 +219,7 @@ class AgentRunController:
                 progress_artifact_id = self._write_progress_artifact(session, agent_run, iteration, observation, evaluation)
                 iteration.progress_artifact_id = progress_artifact_id
                 agent_run.heartbeat_at = utc_now()
+                self._record_evaluation_event(session, agent_run_id, iteration_id, evaluation)
                 record_effectiveness_event(
                     session,
                     agent_run_id=agent_run_id,
@@ -239,6 +244,9 @@ class AgentRunController:
                             "linked_run_id": observation.get("run_id"),
                             "progress_artifact_id": progress_artifact_id,
                             "selected_action": selected.to_dict(),
+                            "satisfied_requirements": evaluation.get("satisfied_requirements", []),
+                            "missing_requirements": evaluation.get("missing_requirements", []),
+                            "evidence_refs": evaluation.get("evidence_refs", []),
                         },
                         ensure_ascii=False,
                         sort_keys=True,
@@ -258,10 +266,13 @@ class AgentRunController:
                     agent_run.final_result_json = json.dumps(
                         {
                             "content": observation.get("output", ""),
+                            "partial_result": observation.get("output", ""),
                             "error": observation.get("error"),
                             "iterations": iteration_index,
                             "progress_artifact_id": progress_artifact_id,
                             "incomplete_conditions": evaluation.get("incomplete_conditions", []),
+                            "missing_requirements": evaluation.get("missing_requirements", []),
+                            "resume_cursor": _resume_cursor(agent_run_id, iteration_index, evaluation, progress_artifact_id),
                         },
                         ensure_ascii=False,
                         sort_keys=True,
@@ -278,6 +289,7 @@ class AgentRunController:
                 break
 
         with session_scope(self.home) as session:
+            self._record_memory_use_events(session, agent_run_id)
             consolidate_memory_candidates(session, agent_run_id=agent_run_id)
 
         assert final is not None
@@ -506,25 +518,18 @@ class AgentRunController:
     def _evaluate_observation(
         self,
         goal: str,
+        goal_analysis: dict[str, Any],
         observation: dict[str, Any],
         iteration_index: int,
         max_iterations: int,
     ) -> dict[str, Any]:
-        output = str(observation.get("output", "")).strip()
-        complete = observation.get("status") == "completed" and bool(output)
-        incomplete_conditions: list[str] = []
-        if complete and _goal_requires_test_command(goal) and not _output_has_test_command_evidence(output):
-            complete = False
-            incomplete_conditions.append("test command evidence missing from observation")
-        if not complete and not incomplete_conditions:
-            incomplete_conditions.append("action did not produce a completed non-empty observation")
-        return {
-            "complete": complete,
-            "goal_type": "code" if _goal_requires_test_command(goal) else "general",
-            "next_action": "finish" if complete else "replan",
-            "incomplete_conditions": [] if complete else incomplete_conditions,
-            "remaining_iterations": max(0, max_iterations - iteration_index),
-        }
+        return evaluate_goal_observation(
+            goal,
+            observation,
+            iteration_index=iteration_index,
+            max_iterations=max_iterations,
+            goal_analysis=goal_analysis,
+        )
 
     def _write_progress_artifact(
         self,
@@ -548,6 +553,7 @@ class AgentRunController:
             "selected_action": _json_dict(iteration.selected_action_json),
             "observation": observation,
             "evaluation": evaluation,
+            "progress": _progress_envelope(iteration.iteration_index, observation, evaluation),
             "heartbeat_at": agent_run.heartbeat_at.isoformat() if agent_run.heartbeat_at else "",
         }
         content = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
@@ -568,6 +574,79 @@ class AgentRunController:
         )
         session.add(artifact)
         return artifact.id
+
+    def _record_evaluation_event(
+        self,
+        session,
+        agent_run_id: str,
+        iteration_id: str,
+        evaluation: dict[str, Any],
+    ) -> None:
+        session.add(
+            AgentEvaluationEvent(
+                id=str(uuid4()),
+                agent_run_id=agent_run_id,
+                iteration_id=iteration_id,
+                goal_type=str(evaluation.get("goal_type", "general")),
+                complete="true" if evaluation.get("complete") else "false",
+                confidence=str(evaluation.get("confidence", "0.0")),
+                requirements_json=json.dumps(evaluation.get("requirements", []), ensure_ascii=False, sort_keys=True),
+                satisfied_requirements_json=json.dumps(evaluation.get("satisfied_requirements", []), ensure_ascii=False, sort_keys=True),
+                missing_requirements_json=json.dumps(evaluation.get("missing_requirements", []), ensure_ascii=False, sort_keys=True),
+                evidence_refs_json=json.dumps(evaluation.get("evidence_refs", []), ensure_ascii=False, sort_keys=True),
+                next_probe=str(evaluation.get("next_probe") or "") or None,
+            )
+        )
+
+    def _record_memory_use_events(self, session, agent_run_id: str) -> None:
+        agent_run = session.get(AgentRun, agent_run_id)
+        if agent_run is None:
+            return
+        iterations = (
+            session.execute(
+                select(AgentIteration)
+                .where(AgentIteration.agent_run_id == agent_run_id)
+                .order_by(AgentIteration.iteration_index)
+            )
+            .scalars()
+            .all()
+        )
+        outcome = "helped" if agent_run.status == "completed" else "not_enough"
+        for iteration in iterations:
+            plan = _json_dict(iteration.plan_json)
+            memory_ids = [str(item) for item in plan.get("memory_ids", []) if item]
+            if not memory_ids:
+                continue
+            action = _json_dict(iteration.selected_action_json)
+            selected_action = str(action.get("name") or "")
+            for memory_id in memory_ids:
+                existing = (
+                    session.execute(
+                        select(MemoryUseEvent)
+                        .where(MemoryUseEvent.agent_run_id == agent_run_id)
+                        .where(MemoryUseEvent.iteration_id == iteration.id)
+                        .where(MemoryUseEvent.memory_id == memory_id)
+                    )
+                    .scalars()
+                    .first()
+                )
+                if existing is not None:
+                    existing.selected_action = selected_action
+                    existing.run_status = agent_run.status
+                    existing.outcome = outcome
+                    continue
+                session.add(
+                    MemoryUseEvent(
+                        id=str(uuid4()),
+                        memory_id=memory_id,
+                        agent_run_id=agent_run_id,
+                        iteration_id=iteration.id,
+                        query=agent_run.goal,
+                        selected_action=selected_action,
+                        run_status=agent_run.status,
+                        outcome=outcome,
+                    )
+                )
 
 
 def agent_run_to_dict(row: AgentRun, iterations: list[AgentIteration]) -> dict[str, Any]:
@@ -630,18 +709,42 @@ def _previous_observations_from_iterations(iterations: list[AgentIteration]) -> 
         if not evaluation.get("complete", observation.get("status") == "completed"):
             selector_observation["status"] = "incomplete"
             selector_observation["error_code"] = observation.get("error_code") or "goal_incomplete"
+            selector_observation["missing_requirements"] = evaluation.get("missing_requirements", [])
         previous.append(selector_observation)
     return previous
 
 
-def _goal_requires_test_command(goal: str) -> bool:
-    lowered = goal.lower()
-    return any(term in lowered for term in ["test command", "pytest", "tests", "test", "测试命令", "测试"])
+def _progress_envelope(iteration_index: int, observation: dict[str, Any], evaluation: dict[str, Any]) -> dict[str, Any]:
+    evidence = list(evaluation.get("evidence_refs", []))
+    blockers = list(evaluation.get("missing_requirements", []))
+    return {
+        "done": [f"iteration {iteration_index} recorded"],
+        "doing": "finish" if evaluation.get("complete") else "replan",
+        "next": str(evaluation.get("next_probe") or evaluation.get("next_action") or ""),
+        "blockers": [] if evaluation.get("complete") else blockers,
+        "evidence": evidence,
+        "goal_state": {
+            "satisfied_requirements": list(evaluation.get("satisfied_requirements", [])),
+            "missing_requirements": list(evaluation.get("missing_requirements", [])),
+            "confidence": evaluation.get("confidence", 0.0),
+            "observation_status": observation.get("status"),
+        },
+    }
 
 
-def _output_has_test_command_evidence(output: str) -> bool:
-    lowered = output.lower()
-    return any(term in lowered for term in ["pytest", "python -m pytest", "unittest", "tox", "py.test", "nox"])
+def _resume_cursor(
+    agent_run_id: str,
+    iteration_index: int,
+    evaluation: dict[str, Any],
+    progress_artifact_id: str | None,
+) -> dict[str, Any]:
+    return {
+        "agent_run_id": agent_run_id,
+        "next_iteration_index": iteration_index + 1,
+        "next_probe": evaluation.get("next_probe"),
+        "missing_requirements": evaluation.get("missing_requirements", []),
+        "progress_artifact_id": progress_artifact_id,
+    }
 
 
 def _capability_type(action_type: str) -> str:

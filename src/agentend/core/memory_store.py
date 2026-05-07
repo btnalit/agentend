@@ -71,8 +71,10 @@ def search_memory_items(session: Session, query: str, *, scope: str | None = Non
 
 def search_memory_candidates(session: Session, query: str, *, scope: str | None = None, limit: int = 10) -> list[MemoryItem]:
     rows = _search_memory_fts(session, query, scope=scope, limit=limit)
-    if rows is None:
-        rows = _search_memory_fallback(session, query, scope=scope)
+    if rows is None or not rows:
+        fallback_rows = _search_memory_fallback(session, query, scope=scope)
+        if rows is None or fallback_rows:
+            rows = fallback_rows
     rows.sort(key=lambda row: (_confidence(row), row.created_at), reverse=True)
     return rows[:limit]
 
@@ -177,7 +179,10 @@ def _search_memory_fts(session: Session, query: str, *, scope: str | None, limit
         return None
     if not ids:
         return []
-    rows = session.execute(select(MemoryItem).where(MemoryItem.id.in_(ids))).scalars().all()
+    stmt = select(MemoryItem).where(MemoryItem.id.in_(ids))
+    if scope:
+        stmt = stmt.where(MemoryItem.scope == scope)
+    rows = session.execute(stmt).scalars().all()
     return rows
 
 
@@ -186,7 +191,9 @@ def _search_memory_fallback(session: Session, query: str, *, scope: str | None) 
     if scope:
         stmt = stmt.where(MemoryItem.scope == scope)
     rows = session.execute(stmt).scalars().all()
-    terms = [term.lower() for term in query.split() if term]
+    terms = _memory_query_terms(query)
+    if not terms:
+        return []
     return [row for row in rows if all(term in row.content.lower() for term in terms)]
 
 
@@ -215,5 +222,24 @@ def _confidence(memory: MemoryItem) -> float:
 
 
 def _sanitize_fts_query(query: str) -> str:
-    terms = re.findall(r"[A-Za-z0-9_]+", query.lower())
-    return " ".join(terms)
+    return " ".join(_memory_query_terms(query))
+
+
+def _memory_query_terms(query: str) -> list[str]:
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "for",
+        "in",
+        "is",
+        "me",
+        "of",
+        "or",
+        "please",
+        "the",
+        "to",
+        "with",
+    }
+    return [term for term in re.findall(r"\w+", query.lower()) if term not in stopwords]

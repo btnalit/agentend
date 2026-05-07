@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from agentend.config import load_config
 from agentend.core.capabilities import query_capabilities, refresh_capabilities
 from agentend.core.events import record_event
+from agentend.core.agent_evaluator import infer_goal_requirements
 from agentend.core.skills import ensure_builtin_skills
 from agentend.core.workspace_indexer import index_workspace, workspace_summary
 from agentend.core.workflow_registry import WorkflowRegistry
@@ -61,6 +62,7 @@ def analyze_goal(home: Path, session: Session, text: str) -> dict[str, Any]:
     payload = {
         "goal": normalized,
         "constraints": [],
+        "requirements": [requirement.to_dict() for requirement in infer_goal_requirements(normalized, {})],
         "candidate_skills": candidate_skills,
         "candidate_tools": candidate_tools,
         "candidate_workflows": candidate_workflows,

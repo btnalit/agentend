@@ -323,3 +323,46 @@ def test_resume_success_refreshes_memory_candidates_after_initial_failure(tmp_pa
         assert "failure_lesson" in candidate_types
         assert "successful_procedure" in candidate_types
         assert any(memory.scope == "project" and memory.status == "active" for memory in memories)
+
+
+def test_resume_reconstructed_observations_preserve_missing_requirements(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+
+    original_execute_action = AgentRunController._execute_action
+
+    def irrelevant_completed_action(self, selected, request, *, agent_run_id: str, iteration_id: str) -> dict:
+        return {
+            "status": "completed",
+            "run_id": None,
+            "output": "Goal: List the project test command and explain evidence.\nPython 3.13.7",
+            "error": None,
+        }
+
+    monkeypatch.setattr(AgentRunController, "_execute_action", irrelevant_completed_action)
+    failed = AgentRunController(home).run(
+        "List the project test command and explain evidence.",
+        max_iterations=1,
+    )
+    assert failed.status == "failed"
+
+    monkeypatch.setattr(AgentRunController, "_execute_action", original_execute_action)
+    resumed = AgentRunController(home).resume(failed.agent_run_id, max_iterations=1)
+
+    assert resumed.status == "completed"
+    with session_scope(home) as session:
+        iteration = (
+            session.execute(
+                select(AgentIteration)
+                .where(AgentIteration.agent_run_id == failed.agent_run_id)
+                .where(AgentIteration.iteration_index == 2)
+            )
+            .scalars()
+            .one()
+        )
+        plan = json.loads(iteration.plan_json)
+        previous = plan["previous_observations"][0]
+        shell_candidate = next(item for item in plan["selector_trace"]["candidates"] if item["name"] == "shell.run")
+        assert previous["missing_requirements"] == ["test_command_evidence"]
+        assert shell_candidate["score_breakdown"]["requirement_match"] > 0

@@ -268,6 +268,9 @@ class _HTTPFixture:
 
             def do_POST(self) -> None:  # noqa: N802
                 owner.posts += 1
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                if length:
+                    self.rfile.read(length)
                 self._write_json({"method": "POST", "count": owner.posts})
 
             def _write_json(self, payload: dict) -> None:
