@@ -312,34 +312,90 @@ def _run_long_task_worker_suite(home: Path) -> dict[str, object]:
 
 
 def _run_agent_replan_suite(home: Path) -> dict[str, object]:
-    result = AgentRunController(home).run(
-        "Use missing.provider.force_fail to build a recoverable report.",
-        channel="eval",
-        external_user_id="agent-replan",
-        max_iterations=2,
-    )
-    with session_scope(home) as session:
-        iterations = (
-            session.execute(
-                select(AgentIteration)
-                .where(AgentIteration.agent_run_id == result.agent_run_id)
-                .order_by(AgentIteration.iteration_index)
-            )
-            .scalars()
-            .all()
+    workflow_path, original_workflow = _prepare_agent_replan_failure_fixture(home)
+    try:
+        result = AgentRunController(home).run(
+            "List the project test command and recover from a first action failure.",
+            channel="eval",
+            external_user_id="agent-replan",
+            max_iterations=2,
         )
-        cases = [
-            _case(
-                "agent-stops-with-explicit-reason",
-                {"agent_run_id": result.agent_run_id, "iteration_count": len(iterations), "stop_reason": result.stop_reason},
-                [
-                    _assertion("bounded iteration loop returns", bool(result.agent_run_id)),
-                    _assertion("stop reason is explicit", result.stop_reason in {"success", "max_iterations_reached"}),
-                    _assertion("iteration count respects max", len(iterations) <= 2),
-                ],
+        with session_scope(home) as session:
+            iterations = (
+                session.execute(
+                    select(AgentIteration)
+                    .where(AgentIteration.agent_run_id == result.agent_run_id)
+                    .order_by(AgentIteration.iteration_index)
+                )
+                .scalars()
+                .all()
             )
-        ]
-    return _suite_payload("agent-replan", cases)
+            first = iterations[0] if len(iterations) >= 1 else None
+            second = iterations[1] if len(iterations) >= 2 else None
+            first_action = _json_or_empty(first.selected_action_json if first else "")
+            second_action = _json_or_empty(second.selected_action_json if second else "")
+            first_observation = _json_or_empty(first.observation_json if first else "")
+            second_observation = _json_or_empty(second.observation_json if second else "")
+            cases = [
+                _case(
+                    "agent-replans-after-failed-action",
+                    {
+                        "agent_run_id": result.agent_run_id,
+                        "iteration_count": len(iterations),
+                        "stop_reason": result.stop_reason,
+                        "first_action": first_action,
+                        "second_action": second_action,
+                        "first_observation": first_observation,
+                        "second_observation": second_observation,
+                    },
+                    [
+                        _assertion("bounded iteration loop returns", bool(result.agent_run_id)),
+                        _assertion("stop reason is explicit", result.stop_reason in {"success", "max_iterations_reached"}),
+                        _assertion("first action failed", first_observation.get("status") == "failed"),
+                        _assertion("second iteration is recorded", second is not None),
+                        _assertion("second action differs", bool(first_action.get("name")) and first_action.get("name") != second_action.get("name")),
+                        _assertion("iteration count respects max", 2 <= len(iterations) <= 2),
+                    ],
+                )
+            ]
+        return _suite_payload("agent-replan", cases)
+    finally:
+        workflow_path.write_text(original_workflow, encoding="utf-8")
+
+
+def _prepare_agent_replan_failure_fixture(home: Path) -> tuple[Path, str]:
+    with session_scope(home) as session:
+        skill = next(row for row in ensure_builtin_skills(home, session) if row.id == "code.local_task")
+        workflow_path = Path(skill.workflow_path)
+    original_workflow = workflow_path.read_text(encoding="utf-8")
+    workflow_path.write_text(
+        """id: skill.code.local_task
+name: code.local_task
+nodes:
+  - id: read_missing
+    type: tool
+    tool: fs.read_text
+    input:
+      path: __agentend_missing_replan_fixture__.txt
+  - id: git_status
+    type: tool
+    tool: git.status
+    input:
+      cwd: .
+    depends_on: [read_missing]
+  - id: python_version
+    type: tool
+    tool: shell.run
+    input:
+      command: python --version
+    depends_on: [git_status]
+  - id: final
+    type: final
+    depends_on: [python_version]
+""",
+        encoding="utf-8",
+    )
+    return workflow_path, original_workflow
 
 
 def _run_smoke_suite(home: Path) -> dict[str, object]:

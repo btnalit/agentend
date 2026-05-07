@@ -39,7 +39,9 @@ def extract_memory_candidates(
     run_id: str | None = None,
 ) -> list[MemoryCandidate]:
     existing = _candidate_query(session, agent_run_id=agent_run_id, run_id=run_id)
-    if existing or (not agent_run_id and not run_id):
+    if not agent_run_id and (existing or not run_id):
+        return list(existing)
+    if run_id and existing:
         return list(existing)
 
     candidates: list[MemoryCandidate] = []
@@ -47,6 +49,9 @@ def extract_memory_candidates(
         agent_run = session.get(AgentRun, agent_run_id)
         if agent_run is None:
             raise ValueError(f"Unknown agent run: {agent_run_id}")
+        desired_type = "successful_procedure" if agent_run.status == "completed" else "failure_lesson"
+        if any(candidate.type == desired_type for candidate in existing):
+            return list(existing)
         candidates.extend(_candidates_from_agent_run(session, agent_run))
     elif run_id:
         run = session.get(Run, run_id)
@@ -56,7 +61,7 @@ def extract_memory_candidates(
 
     for candidate in candidates:
         session.add(candidate)
-    return candidates
+    return list(existing) + candidates
 
 
 def consolidate_memory_candidates(
@@ -257,6 +262,13 @@ def _apply_auto_relation(
         replacement = _supersede_memory(session, candidate, target, reason=f"auto relation update: {decision.reason}")
         _add_relation_link(session, replacement.id, candidate.id, "relation_decision")
         return candidate.status, replacement.id
+    if decision.relation == "updates":
+        candidate.status = "needs_review"
+        candidate.memory_id = target.id
+        candidate.decision_reason = f"auto relation update needs review for memory {target.id}: {decision.reason}"
+        _add_relation_link(session, target.id, candidate.id, "needs_review_for")
+        _add_relation_link(session, target.id, candidate.id, "relation_decision")
+        return candidate.status, target.id
     if decision.relation == "conflicts":
         if decision.confidence >= 0.85 and has_direct_evidence(candidate):
             replacement = _supersede_memory(session, candidate, target, reason=f"auto relation conflict with direct evidence: {decision.reason}")

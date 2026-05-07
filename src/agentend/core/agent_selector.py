@@ -62,12 +62,14 @@ def select_next_action_with_trace(
     sync_tool_manifests(session, ToolRegistry(resolved_home).manifests())
     refresh_capabilities(session)
     analysis = goal_analysis or {}
+    previous = previous_observations or []
     failed_names = {
         str(observation.get("action_name"))
-        for observation in (previous_observations or [])
+        for observation in previous
         if observation.get("status") != "completed"
     }
     goal_type = _goal_type(goal, analysis)
+    needs_command_probe = _needs_test_command_probe(goal, goal_type, previous)
     candidates: list[dict[str, Any]] = []
 
     skill_candidates = _ordered_skill_candidates(session, goal, analysis)
@@ -85,7 +87,7 @@ def select_next_action_with_trace(
         if tool.enabled != "true":
             candidates.append(_candidate_trace("tool_call", tool.name, {}, -1.0, ["tool disabled"], _tool_input(tool.name, goal)))
             continue
-        breakdown, rejected_reasons = _score_tool(session, tool, goal, goal_type, failed_names, analysis)
+        breakdown, rejected_reasons = _score_tool(session, tool, goal, goal_type, failed_names, analysis, needs_command_probe)
         candidates.append(
             _candidate_trace("tool_call", tool.name, breakdown, sum(breakdown.values()), rejected_reasons, _tool_input(tool.name, goal))
         )
@@ -191,7 +193,7 @@ def _score_skill(
     if skill.id in [str(item) for item in analysis.get("candidate_skills", [])]:
         breakdown["goal_analyzer_candidate"] = 2.0
     if skill.id in failed_names:
-        breakdown["previous_iteration_penalty"] = -2.0
+        breakdown["previous_iteration_penalty"] = -5.0
         rejected_reasons.append("failed in previous iteration")
     if skill.id in _fallback_skill_ids(lowered):
         breakdown["fallback_match"] = 2.0
@@ -214,6 +216,7 @@ def _score_tool(
     goal_type: str,
     failed_names: set[str],
     analysis: dict[str, Any],
+    needs_command_probe: bool,
 ) -> tuple[dict[str, float], list[str]]:
     lowered = goal.lower()
     breakdown = _base_breakdown(base=1.5)
@@ -221,10 +224,12 @@ def _score_tool(
     if tool.name in [str(item) for item in analysis.get("candidate_tools", [])]:
         breakdown["goal_analyzer_candidate"] = 2.0
     if tool.name in failed_names:
-        breakdown["previous_iteration_penalty"] = -2.0
+        breakdown["previous_iteration_penalty"] = -5.0
         rejected_reasons.append("failed in previous iteration")
     if tool.name in _fallback_tool_ids(lowered):
         breakdown["fallback_match"] = 1.5
+    if needs_command_probe and tool.name == "shell.run":
+        breakdown["replan_probe"] = 3.0
     for term in _terms(lowered):
         if term and (term in tool.name.lower() or term in tool.description.lower()):
             breakdown["text_match"] += 0.3
@@ -246,6 +251,7 @@ def _base_breakdown(base: float = 2.0) -> dict[str, float]:
         "previous_iteration_penalty": 0.0,
         "recent_failure_penalty": 0.0,
         "effectiveness": 0.0,
+        "replan_probe": 0.0,
     }
 
 
@@ -351,6 +357,12 @@ def _goal_type(goal: str, analysis: dict[str, Any]) -> str:
     if "file.workspace_ops" in candidates or _contains_any(lowered, ["file", "workspace", "read", "list", "文件", "读取"]):
         return "workspace"
     return "general"
+
+
+def _needs_test_command_probe(goal: str, goal_type: str, previous_observations: list[dict[str, Any]]) -> bool:
+    if goal_type != "code" or not _contains_any(goal.lower(), ["test", "pytest", "测试"]):
+        return False
+    return any(observation.get("status") != "completed" for observation in previous_observations)
 
 
 def _fallback_skill_ids(lowered_goal: str) -> list[str]:

@@ -83,10 +83,75 @@ class AgentRunController:
         if not request.goal:
             raise ValueError("Agent goal must not be empty")
         agent_run_id = self._start_run(request)
-        previous_observations: list[dict[str, Any]] = []
+        return self._run_loop(
+            request,
+            agent_run_id=agent_run_id,
+            start_iteration_index=1,
+            max_iteration_index=request.max_iterations,
+            previous_observations=[],
+        )
+
+    def resume(
+        self,
+        agent_run_id: str,
+        *,
+        max_iterations: int = 3,
+        run_mode: str = "normal",
+    ) -> AgentRunResult:
+        additional_iterations = max(1, int(max_iterations))
+        with session_scope(self.home) as session:
+            agent_run = session.get(AgentRun, agent_run_id)
+            if agent_run is None:
+                raise ValueError(f"Unknown agent run: {agent_run_id}")
+            iterations = (
+                session.execute(
+                    select(AgentIteration)
+                    .where(AgentIteration.agent_run_id == agent_run_id)
+                    .order_by(AgentIteration.iteration_index)
+                )
+                .scalars()
+                .all()
+            )
+            if agent_run.status == "completed":
+                return _result_from_agent_run(agent_run)
+            if agent_run.status == "cancelled":
+                raise ValueError(f"Cannot resume cancelled agent run: {agent_run_id}")
+            previous_observations = _previous_observations_from_iterations(iterations)
+            start_iteration_index = (iterations[-1].iteration_index + 1) if iterations else 1
+            max_iteration_index = start_iteration_index + additional_iterations - 1
+            agent_run.status = "running"
+            agent_run.stop_reason = None
+            agent_run.completed_at = None
+            agent_run.heartbeat_at = utc_now()
+            agent_run.max_iterations = max(agent_run.max_iterations, max_iteration_index)
+            request = AgentRunRequest(
+                goal=agent_run.goal,
+                channel=agent_run.channel,
+                external_user_id=agent_run.external_user_id,
+                max_iterations=additional_iterations,
+                run_mode=run_mode,
+                conversation_id=agent_run.conversation_id,
+            )
+        return self._run_loop(
+            request,
+            agent_run_id=agent_run_id,
+            start_iteration_index=start_iteration_index,
+            max_iteration_index=max_iteration_index,
+            previous_observations=previous_observations,
+        )
+
+    def _run_loop(
+        self,
+        request: AgentRunRequest,
+        *,
+        agent_run_id: str,
+        start_iteration_index: int,
+        max_iteration_index: int,
+        previous_observations: list[dict[str, Any]],
+    ) -> AgentRunResult:
         final: AgentRunResult | None = None
 
-        for iteration_index in range(1, request.max_iterations + 1):
+        for iteration_index in range(start_iteration_index, max_iteration_index + 1):
             with session_scope(self.home) as session:
                 agent_run = session.get(AgentRun, agent_run_id)
                 assert agent_run is not None
@@ -128,8 +193,12 @@ class AgentRunController:
                 iteration_id=iteration_id,
             )
             duration_ms = int((perf_counter() - started) * 1000)
-            evaluation = self._evaluate_observation(observation, iteration_index, request.max_iterations)
-            previous_observations.append(observation | {"action_name": selected.name})
+            evaluation = self._evaluate_observation(request.goal, observation, iteration_index, max_iteration_index)
+            selector_observation = observation | {"action_name": selected.name}
+            if not evaluation["complete"]:
+                selector_observation["status"] = "incomplete"
+                selector_observation["error_code"] = observation.get("error_code") or "goal_incomplete"
+            previous_observations.append(selector_observation)
 
             with session_scope(self.home) as session:
                 iteration = session.get(AgentIteration, iteration_id)
@@ -153,8 +222,8 @@ class AgentRunController:
                     capability_type=_capability_type(selected.type),
                     capability_id=selected.name,
                     goal_type=str(evaluation.get("goal_type", "general")),
-                    status="success" if observation.get("status") == "completed" else "failure",
-                    error_code=observation.get("error_code"),
+                    status="success" if evaluation["complete"] else "failure",
+                    error_code=observation.get("error_code") or (None if evaluation["complete"] else "goal_incomplete"),
                     duration_ms=duration_ms,
                     output_artifact_count=1 if progress_artifact_id else 0,
                     iteration_count=iteration_index,
@@ -182,7 +251,7 @@ class AgentRunController:
                         linked_run_id=observation.get("run_id"),
                         progress_artifact_id=progress_artifact_id,
                     )
-                elif iteration_index >= request.max_iterations:
+                elif iteration_index >= max_iteration_index:
                     agent_run.status = "failed"
                     agent_run.stop_reason = "max_iterations_reached"
                     agent_run.completed_at = utc_now()
@@ -436,16 +505,24 @@ class AgentRunController:
 
     def _evaluate_observation(
         self,
+        goal: str,
         observation: dict[str, Any],
         iteration_index: int,
         max_iterations: int,
     ) -> dict[str, Any]:
-        complete = observation.get("status") == "completed" and bool(str(observation.get("output", "")).strip())
+        output = str(observation.get("output", "")).strip()
+        complete = observation.get("status") == "completed" and bool(output)
+        incomplete_conditions: list[str] = []
+        if complete and _goal_requires_test_command(goal) and not _output_has_test_command_evidence(output):
+            complete = False
+            incomplete_conditions.append("test command evidence missing from observation")
+        if not complete and not incomplete_conditions:
+            incomplete_conditions.append("action did not produce a completed non-empty observation")
         return {
             "complete": complete,
-            "goal_type": "general",
+            "goal_type": "code" if _goal_requires_test_command(goal) else "general",
             "next_action": "finish" if complete else "replan",
-            "incomplete_conditions": [] if complete else ["action did not produce a completed non-empty observation"],
+            "incomplete_conditions": [] if complete else incomplete_conditions,
             "remaining_iterations": max(0, max_iterations - iteration_index),
         }
 
@@ -527,6 +604,44 @@ def agent_iteration_to_dict(row: AgentIteration) -> dict[str, Any]:
         "progress_artifact_id": row.progress_artifact_id,
         "error": row.error,
     }
+
+
+def _result_from_agent_run(row: AgentRun) -> AgentRunResult:
+    final_result = _json_dict(row.final_result_json)
+    return AgentRunResult(
+        agent_run_id=row.id,
+        status=row.status,
+        stop_reason=row.stop_reason or "",
+        content=str(final_result.get("content") or ""),
+        linked_run_id=str(final_result.get("linked_run_id") or "") or None,
+        progress_artifact_id=str(final_result.get("progress_artifact_id") or "") or None,
+    )
+
+
+def _previous_observations_from_iterations(iterations: list[AgentIteration]) -> list[dict[str, Any]]:
+    previous: list[dict[str, Any]] = []
+    for iteration in iterations:
+        observation = _json_dict(iteration.observation_json)
+        if not observation:
+            continue
+        action = _json_dict(iteration.selected_action_json)
+        evaluation = _json_dict(iteration.evaluation_json)
+        selector_observation = observation | {"action_name": str(action.get("name") or "")}
+        if not evaluation.get("complete", observation.get("status") == "completed"):
+            selector_observation["status"] = "incomplete"
+            selector_observation["error_code"] = observation.get("error_code") or "goal_incomplete"
+        previous.append(selector_observation)
+    return previous
+
+
+def _goal_requires_test_command(goal: str) -> bool:
+    lowered = goal.lower()
+    return any(term in lowered for term in ["test command", "pytest", "tests", "test", "测试命令", "测试"])
+
+
+def _output_has_test_command_evidence(output: str) -> bool:
+    lowered = output.lower()
+    return any(term in lowered for term in ["pytest", "python -m pytest", "unittest", "tox", "py.test", "nox"])
 
 
 def _capability_type(action_type: str) -> str:

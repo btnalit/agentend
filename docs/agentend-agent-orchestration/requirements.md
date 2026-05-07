@@ -405,3 +405,83 @@ Residual:
 - The classifier is schema-driven and metadata-scoped. It can consume structured LLM JSON when a relation backend is available, and falls back to the verified local conservative classifier for offline operation.
 - Auto supersede is intentionally gated by confidence and direct evidence to avoid polluting long-term memory.
 - Eval isolation changes CLI defaults; tests or workflows that intentionally depend on base-home state must pass `--shared-home`.
+
+## 12. Review Remediation Requirements - 2026-05-07
+
+Status: planned for immediate remediation.
+
+Requirements:
+- `agentend agent resume <agent_run_id>` must resume the same AgentRun record and append iterations after the last recorded iteration.
+- Resume must not re-execute previous iterations. Existing observations must be used only as selector/evaluator context.
+- A completed AgentRun must not be duplicated by resume; the command should report the existing final result.
+- `agent-replan` eval must create a deterministic offline first-action failure and prove a different second action was selected.
+- Medium-confidence auto relation `updates` decisions must become `needs_review` instead of falling through to ordinary active memory creation.
+
+Verification targets:
+```bash
+.venv\Scripts\python.exe -m pytest tests\test_agent_run_controller.py tests\test_agent_orchestration_eval.py tests\test_agent_memory_relation.py -q --basetemp=.tmp\agent-review-remediation-red -p no:cacheprovider
+.venv\Scripts\agentend.exe eval run agent-replan --home .tmp\agent-review-remediation-home
+```
+
+## 13. Review Remediation Implementation Backfill - 2026-05-07
+
+Status: O27-O29 implemented.
+
+Implemented acceptance scope:
+- `agentend agent resume <agent_run_id>` now resumes the existing AgentRun through `AgentRunController.resume(...)`.
+- Resume rebuilds selector context from persisted previous observations and appends new iterations after the last recorded iteration.
+- Completed AgentRuns return the existing final result instead of creating duplicates.
+- The selector now applies a stronger previous-iteration failure penalty, allowing a viable fallback action to win on the next loop.
+- `agent-replan` eval now forces an offline first-action failure and asserts that the second action differs.
+- Medium-confidence auto relation `updates` decisions now become `needs_review`, link to the target memory, and keep the target active.
+
+Verification evidence:
+- Red tests before implementation: 3 failed.
+- Focused remediation tests: 3 passed.
+- Related orchestration tests: 25 passed.
+- Full suite: 147 passed.
+- Compileall: passed.
+- `agent-replan`, `memory-consolidation`, `orchestration-smoke`, and `long-task-worker` evals passed.
+
+## 14. Review Remediation Requirements - Evaluator, Eval Fixture, Resume Memory - 2026-05-07
+
+Status: planned for immediate remediation.
+
+Requirements:
+- AgentRun evaluation must check simple goal-specific satisfaction signals, not only `status=completed` and non-empty output.
+- For test-command goals, success requires output that includes test-command evidence such as `pytest` or an explicit test command.
+- Echoing the goal text, including words like `test command`, must not satisfy the evidence gate unless real test tooling evidence is present.
+- `agent-replan` eval must restore any builtin skill workflow it mutates, including when run with `--shared-home`.
+- Resuming a previously failed AgentRun to completion must allow memory candidate extraction to reflect the new final status.
+- After a missing-evidence observation on a test-command goal, the selector must prefer a direct command probe over another non-evidence skill loop when such a tool is available.
+
+Verification targets:
+```bash
+.venv\Scripts\python.exe -m pytest tests\test_agent_run_controller.py tests\test_agent_orchestration_eval.py tests\test_agent_memory_consolidator.py -q --basetemp=.tmp\agent-review-remediation-2-red -p no:cacheprovider
+.venv\Scripts\agentend.exe eval run agent-replan --home .tmp\agent-review-remediation-2-home --shared-home
+```
+
+## 15. Review Remediation Implementation Backfill - Evaluator, Eval Fixture, Resume Memory - 2026-05-07
+
+Status: O30-O32 implemented.
+
+Implemented acceptance scope:
+- AgentRun evaluator now marks completed observations incomplete when a test-command goal lacks concrete test-tool evidence.
+- Test-command evidence is restricted to command/tool markers such as `pytest`, `python -m pytest`, `unittest`, `tox`, `py.test`, or `nox`; goal text echo is not enough.
+- Missing evidence is persisted in `incomplete_conditions`, and the action is recorded as effectiveness failure with `goal_incomplete`.
+- Selector replan scoring now boosts `shell.run` with `replan_probe` after a test-command goal has failed or incomplete previous observations.
+- `agent-replan --shared-home` captures the original `code.local_task` workflow and restores it in `finally`.
+- Memory candidate extraction is status-sensitive for AgentRun candidates, so a failed-then-completed resume can add `successful_procedure` after an earlier `failure_lesson`.
+
+Verification evidence:
+- Focused O30-O32 tests: 3 passed.
+- Selector replan regression tests: 3 passed.
+- Related orchestration tests: 28 passed.
+- Closeout resume boundary tests added for completed/cancelled runs.
+- Closeout focused tests: 7 passed.
+- Closeout related orchestration tests: 30 passed.
+- Full suite: 152 passed.
+- Compileall: passed.
+- `agent-replan --shared-home`, `orchestration-smoke`, `memory-consolidation`, and `long-task-worker` evals passed.
+- A normal `agent run` in the same home after shared-home `agent-replan` completed with `pytest 8.4.2`, proving fixture restoration and selector command probing.
+- `git diff --check`: exit 0; Windows CRLF warnings only.

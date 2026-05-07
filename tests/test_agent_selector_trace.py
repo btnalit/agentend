@@ -20,7 +20,9 @@ def test_selector_trace_records_top_candidates_and_score_breakdown(tmp_path: Pat
 
     assert result.exit_code == 0, result.output
     with session_scope(home) as session:
-        iteration = session.execute(select(AgentIteration)).scalar_one()
+        iterations = session.execute(select(AgentIteration).order_by(AgentIteration.iteration_index)).scalars().all()
+        assert iterations
+        iteration = iterations[0]
         plan = json.loads(iteration.plan_json)
         trace = plan["selector_trace"]
         assert trace["selected"]["name"]

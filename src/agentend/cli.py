@@ -1893,16 +1893,10 @@ def agent_resume(
     home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
     max_iterations: int = typer.Option(3, "--max-iterations", help="Maximum resumed loop iterations."),
 ) -> None:
-    """Resume by starting a new AgentRun from the previous goal."""
+    """Resume an existing AgentRun by appending new iterations."""
     resolved_home = home or Path.cwd()
     try:
-        previous = AgentRunController(resolved_home).show(agent_run_id)
-        result = AgentRunController(resolved_home).run(
-            str(previous["goal"]),
-            channel=str(previous["channel"]),
-            external_user_id=str(previous["external_user_id"]),
-            max_iterations=max_iterations,
-        )
+        result = AgentRunController(resolved_home).resume(agent_run_id, max_iterations=max_iterations)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     typer.echo(f"AgentRun: {result.agent_run_id}")

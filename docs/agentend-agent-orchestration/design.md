@@ -782,3 +782,91 @@ agentend eval run <suite> --home <base> --shared-home
   -> run suite directly in base home
   -> preserve old stateful eval behavior
 ```
+
+## 20. Review Remediation Design - 2026-05-07
+
+AgentRun resume:
+- Add an `AgentRunController.resume(...)` entrypoint.
+- Load the existing AgentRun and its iterations.
+- Rebuild `previous_observations` from persisted iteration observations and selected action names.
+- Continue the loop on the same `agent_run_id` starting at `max(iteration_index) + 1`.
+- Treat the resume `--max-iterations` value as additional iterations, not as a new run total.
+- If the existing run is already completed, return its current final result without creating new iterations.
+
+Replan eval:
+- Keep the production controller generic.
+- In the `agent-replan` eval fixture, temporarily make the first selected builtin skill fail while still satisfying builtin skill required-tool validation.
+- Verify that the selector consumes the failed previous observation and selects a different viable tool/skill on the second iteration.
+
+Memory relation update gate:
+- Keep high-confidence `updates` as automatic supersede.
+- Convert medium-confidence `updates` to `needs_review`.
+- Link the candidate to the target memory with `needs_review_for` and `relation_decision`.
+- Do not create a new active memory for that candidate until a later high-confidence decision supersedes the target.
+
+## 21. Review Remediation Implementation Backfill - 2026-05-07
+
+Code mapping:
+- `src/agentend/core/agent_run.py`
+  - Added `AgentRunController.resume(...)`.
+  - Split execution into `_run_loop(...)` so new runs and resumed runs share the same action/observe/evaluate logic.
+  - Added previous-observation reconstruction from persisted iterations.
+- `src/agentend/cli.py`
+  - `agent resume` now calls controller resume instead of starting a new run.
+- `src/agentend/core/agent_selector.py`
+  - Strengthened previous-iteration failure penalty so fallback actions can overtake the failed action.
+- `src/agentend/core/eval_harness.py`
+  - `agent-replan` now prepares a failing builtin-skill fixture and verifies a different second action.
+- `src/agentend/core/memory_consolidator.py`
+  - Medium-confidence `updates` relation decisions now become `needs_review`.
+
+Behavioral notes:
+- Resume `--max-iterations` is treated as additional iterations for the existing run.
+- The failed action remains visible in the iteration history and selector trace; it is not deleted or rerun.
+- Medium-confidence update candidates preserve provenance for later review without writing active long-term memory.
+
+## 22. Review Remediation Design - Evaluator, Eval Fixture, Resume Memory - 2026-05-07
+
+Goal satisfaction evaluator:
+- Keep the first implementation rule-based.
+- Extract missing criteria from the goal and observation payload.
+- For test-command goals, require observable test-command evidence in the output.
+- If the action completed but the criteria are missing, mark evaluation incomplete and let the existing loop replan or hit `max_iterations_reached`.
+- Treat goal echoes as non-evidence. The evidence matcher accepts concrete test-tool markers such as `pytest`, `python -m pytest`, `unittest`, `tox`, `py.test`, and `nox`.
+
+Selector replan probe:
+- Preserve the existing first-iteration tool-first/skill scoring.
+- When a code/test goal has any previous failed or incomplete observation, add a `replan_probe` score to `shell.run`.
+- The probe keeps the selector rule-based while making the second iteration gather direct command evidence instead of cycling through high-scoring non-evidence skills.
+- The selected action and trace expose the probe score for eval/debug reports.
+
+Eval fixture restoration:
+- Capture the original `code.local_task` workflow content before writing the failing fixture.
+- Run and inspect the eval inside a `try/finally`.
+- Restore the original file in `finally` so shared homes are not left with the failure fixture.
+
+Resume memory refresh:
+- Keep existing candidate idempotency for repeated consolidation.
+- When an AgentRun status changes from failed to completed, candidate extraction must not return only the stale failure candidate.
+- Add a status-sensitive candidate check so the final successful procedure can be extracted and consolidated.
+
+## 23. Review Remediation Implementation Backfill - Evaluator, Eval Fixture, Resume Memory - 2026-05-07
+
+Code mapping:
+- `src/agentend/core/agent_run.py`
+  - `_evaluate_observation(...)` now receives the goal and emits goal-specific incomplete conditions.
+  - Test-command goals require concrete command evidence and mark missing-evidence observations as `goal_incomplete`.
+  - Previous observations reconstructed from persisted iterations preserve incomplete evaluation status for resume.
+- `src/agentend/core/agent_selector.py`
+  - Added `replan_probe` scoring for `shell.run` when a test-command goal has previous failed/incomplete observations.
+  - Selector trace records the probe in `score_breakdown`.
+- `src/agentend/core/eval_harness.py`
+  - `agent-replan` uses `try/finally` to restore the mutated builtin workflow.
+  - The eval report includes first and second action/observation payloads.
+- `src/agentend/core/memory_consolidator.py`
+  - AgentRun candidate extraction now checks for the candidate type matching the current final run status before returning existing rows.
+
+Behavioral notes:
+- `status=completed` and non-empty output remain necessary but are no longer sufficient for simple goal-specific cases.
+- The current evaluator is intentionally rule-based and narrow; it is not a broad semantic judge.
+- The command probe is activated only after a prior failed/incomplete observation, so initial selection remains compatible with the existing selector calibration.

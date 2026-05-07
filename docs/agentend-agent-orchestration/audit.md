@@ -391,3 +391,85 @@ Residual risks:
 - The classifier is intentionally conservative and metadata-scoped. It is not an embedding search and not a broad natural-language contradiction engine.
 - Structured LLM JSON decisions are supported behind the same contract; the offline conservative fallback is also verified and remains the default when no usable LLM route is configured.
 - File locking protects init, not every normal worker write. Task claim and heartbeat retry behavior can be further hardened if worker concurrency is raised later.
+
+## 12. Review Remediation Audit - 2026-05-07
+
+Findings accepted for remediation:
+- `agent resume` currently starts a fresh AgentRun from the previous goal, so it can rerun already completed work.
+- `agent-replan` currently passes even when the run succeeds in one iteration, so it does not prove a replan path.
+- Medium-confidence auto relation `updates` can fall through into ordinary active memory creation.
+
+Audit checks for the fix:
+- Resume appends to the same AgentRun id and preserves earlier iteration rows.
+- The replan eval report records a failed first action and a different second action.
+- A medium-confidence update candidate is marked `needs_review`, the target memory remains active, and no replacement memory is created.
+
+## 13. Post-Remediation Audit - 2026-05-07
+
+Status: implemented and verified.
+
+Closed audit items:
+- `agent resume` no longer creates a duplicate AgentRun for the same goal.
+- Resume appends iteration 2+ to the original AgentRun and passes previous failed observations back into selector context.
+- `agent-replan` no longer passes on a one-iteration success. The eval fixture forces `code.local_task` to fail first and verifies a fallback action.
+- Medium-confidence `updates` relation decisions no longer fall through into active memory creation.
+
+Verification:
+- Focused red run before implementation: 3 failed.
+- Focused remediation tests: 3 passed.
+- Related orchestration tests: 25 passed.
+- Full suite: 147 passed.
+- Compileall: passed.
+- Eval `agent-replan`: passed and reported first action failed, second action different.
+- Eval `memory-consolidation`: passed.
+- Eval `orchestration-smoke`: passed.
+- Eval `long-task-worker`: passed.
+
+Residual:
+- The evaluator still uses a simple completion gate. It proves tool execution completed, not full semantic goal satisfaction.
+
+## 14. Review Remediation Audit - Evaluator, Eval Fixture, Resume Memory - 2026-05-07
+
+Findings accepted for remediation:
+- The evaluator still marks a non-empty but goal-incomplete output as success.
+- `agent-replan --shared-home` can leave the builtin `code.local_task` workflow pointing at the missing-file fixture.
+- Resume success can be followed by stale memory consolidation because existing failure candidates short-circuit candidate extraction.
+
+Audit checks for the fix:
+- A test-command goal without test-command evidence fails or replans instead of succeeding.
+- `agent-replan --shared-home` restores builtin workflow content after the eval completes.
+- A failed-then-resumed AgentRun has both failure evidence and final successful procedure memory available for consolidation.
+
+## 15. Post-Remediation Audit - Evaluator, Eval Fixture, Resume Memory - 2026-05-07
+
+Status: implemented and verified.
+
+Closed audit items:
+- The evaluator no longer treats any completed non-empty output as success for test-command goals.
+- Goal text echo is not accepted as test-command evidence; the output must include concrete test-tool markers such as `pytest`.
+- Missing evidence records `goal_incomplete`, feeds selector context, and prevents false `stop_reason=success`.
+- Selector replan now boosts `shell.run` after a test-command goal has failed or incomplete previous observations, allowing the next iteration to gather direct command evidence.
+- `agent-replan --shared-home` restores the original `code.local_task` workflow after the eval, including the shared-home path.
+- Resume after an initial failed run can produce both `failure_lesson` and `successful_procedure` candidates for the same AgentRun after final completion.
+
+Verification:
+- Focused O30-O32 tests: 3 passed.
+- Selector replan regression tests: 3 passed.
+- Related orchestration tests: 28 passed.
+- Closeout resume boundary tests added for completed/cancelled runs.
+- Closeout focused tests: 7 passed.
+- Closeout related orchestration tests: 30 passed.
+- Full suite: 152 passed.
+- Compileall: passed.
+- Eval `agent-replan --shared-home`: passed and reported first action `code.local_task` failed, second action `shell.run` succeeded with `pytest 8.4.2`.
+- Eval `orchestration-smoke`: passed.
+- Eval `memory-consolidation`: passed.
+- Eval `long-task-worker`: passed.
+- A normal `agent run` after shared-home `agent-replan` completed with `pytest 8.4.2`, proving the fixture was not left broken.
+- `git diff --check`: exit 0; CRLF warnings only.
+
+Verification notes:
+- One full-suite run showed a transient failure in the HTTP fixture test; the single test passed immediately afterward and a fresh full-suite rerun passed.
+
+Residual:
+- The evaluator remains a narrow rule-based satisfaction gate. Broader semantic goal satisfaction is still future work and should be added with explicit eval cases rather than a generic LLM judge by default.

@@ -675,3 +675,130 @@ Results:
 Notes:
 - Existing eval tests that intentionally mutate base-home state now use `--shared-home`.
 - Default CLI eval isolation reduces accidental cross-suite pollution.
+
+## 12. Review Remediation Tasks - 2026-05-07
+
+### O27 True AgentRun resume `AFK`
+
+Goal: make `agentend agent resume <agent_run_id>` continue the existing AgentRun instead of starting a separate run with the same goal.
+
+Acceptance:
+- Resume appends new iterations to the same `agent_runs.id`.
+- Existing completed/failed iterations are not rerun.
+- Previous observations are passed back to the selector so a failed action can be penalized.
+- Completed runs return the existing final result without creating a duplicate run.
+
+### O28 Strong agent-replan eval `AFK`
+
+Goal: make `agent-replan` prove observe -> evaluate -> replan -> different next action.
+
+Acceptance:
+- The eval fixture forces the first selected action to fail offline.
+- The AgentRun records at least two iterations.
+- The second selected action differs from the first selected action.
+- The eval report includes the first and second action names for failure diagnosis.
+
+### O29 Medium-confidence memory update review gate `AFK`
+
+Goal: prevent medium-confidence `updates` relation decisions from creating a second active long-term memory.
+
+Acceptance:
+- `updates` with confidence below the automatic supersede threshold becomes `needs_review`.
+- The target active memory remains active.
+- No replacement memory is created until the relation confidence is high enough.
+
+## 13. O27-O29 Completion - 2026-05-07
+
+| Task | Status | Evidence |
+| --- | --- | --- |
+| O27 True AgentRun resume | Done | `AgentRunController.resume(...)` appends iterations to the same AgentRun and `agent resume` uses it. |
+| O28 Strong agent-replan eval | Done | `agent-replan` now forces a failed first action and verifies a different second action. |
+| O29 Medium-confidence memory update review gate | Done | Medium-confidence `updates` relation decisions become `needs_review` and do not create active duplicate memory. |
+
+Verification commands:
+```bash
+.venv\Scripts\python.exe -m pytest tests\test_agent_run_controller.py::test_agent_resume_appends_to_existing_run_without_rerunning_iterations tests\test_agent_orchestration_eval.py::test_agent_replan_eval_proves_failed_action_then_different_action tests\test_agent_memory_relation.py::test_medium_confidence_update_needs_review_instead_of_active_duplicate -q --basetemp=.tmp\agent-review-remediation-green -p no:cacheprovider
+.venv\Scripts\python.exe -m pytest tests\test_agent_run_controller.py tests\test_agent_tool_first_selector.py tests\test_agent_selector_trace.py tests\test_agent_memory_consolidator.py tests\test_agent_memory_relation.py tests\test_agent_effectiveness.py tests\test_agent_worker.py tests\test_agent_orchestration_eval.py tests\test_agent_db_init_stability.py -q --basetemp=.tmp\agent-review-remediation-related -p no:cacheprovider
+.venv\Scripts\python.exe -m pytest tests -q --basetemp=.tmp\agent-review-remediation-full -p no:cacheprovider
+.venv\Scripts\python.exe -m compileall -q src tests
+.venv\Scripts\agentend.exe eval run agent-replan --home .tmp\agent-review-remediation-home
+.venv\Scripts\agentend.exe eval run memory-consolidation --home .tmp\agent-review-remediation-home
+.venv\Scripts\agentend.exe eval run orchestration-smoke --home .tmp\agent-review-remediation-home
+.venv\Scripts\agentend.exe eval run long-task-worker --home .tmp\agent-review-remediation-home
+```
+
+Results:
+- Remediation red tests: 3 failed before implementation.
+- Remediation focused tests: 3 passed.
+- Related orchestration tests: 25 passed.
+- Full suite: 147 passed.
+- Compileall: passed.
+- `agent-replan`, `memory-consolidation`, `orchestration-smoke`, and `long-task-worker` evals: passed.
+
+## 14. Review Remediation Tasks - Evaluator, Eval Fixture, Resume Memory - 2026-05-07
+
+### O30 Goal satisfaction evaluator gate `AFK`
+
+Goal: prevent AgentRun from marking a completed-but-irrelevant non-empty observation as success.
+
+Acceptance:
+- Test-command goals require test-command evidence such as pytest/test command output before `stop_reason=success`.
+- Incomplete observations continue/replan until max iterations.
+- Final failed result records missing criteria.
+
+### O31 Restore agent-replan shared-home fixture `AFK`
+
+Goal: keep `agent-replan` eval deterministic without leaving the builtin `code.local_task` workflow broken in shared homes.
+
+Acceptance:
+- `agent-replan --shared-home` restores the original builtin workflow content before returning.
+- The eval report still proves first action failed and second action differed.
+- A subsequent normal `agent run` in the same home does not hit `__agentend_missing_replan_fixture__`.
+
+### O32 Resume memory candidate refresh `AFK`
+
+Goal: after a failed AgentRun resumes successfully, memory consolidation must learn the final successful procedure.
+
+Acceptance:
+- A failed run can create a `failure_lesson` candidate.
+- Resuming the same AgentRun to completion creates or updates a successful candidate for the final status.
+- The successful candidate can be consolidated into active project memory.
+
+## 15. O30-O32 Completion - 2026-05-07
+
+| Task | Status | Evidence |
+| --- | --- | --- |
+| O30 Goal satisfaction evaluator gate | Done | Test-command goals now require concrete command evidence such as `pytest`; goal text echo alone is incomplete. |
+| O31 Restore agent-replan shared-home fixture | Done | `agent-replan --shared-home` restores `code.local_task` workflow content in `finally` and still proves a different second action. |
+| O32 Resume memory candidate refresh | Done | Status-sensitive extraction allows failed-then-completed AgentRuns to keep failure evidence and add a successful procedure candidate. |
+
+Additional selector fix:
+- When a test-command goal has a previous failed/incomplete observation, selector trace gives `shell.run` a `replan_probe` boost so the next iteration can gather command evidence instead of looping across non-evidence skills.
+
+Verification commands:
+```bash
+.venv\Scripts\python.exe -m pytest tests\test_agent_run_controller.py::test_test_command_goal_does_not_complete_without_test_command_evidence tests\test_agent_run_controller.py::test_resume_success_refreshes_memory_candidates_after_initial_failure tests\test_agent_orchestration_eval.py::test_agent_replan_shared_home_restores_builtin_skill_fixture -q --basetemp=.tmp\agent-review-remediation-2-green -p no:cacheprovider
+.venv\Scripts\python.exe -m pytest tests\test_agent_run_controller.py::test_agent_run_cli_records_iteration_progress_effectiveness_and_memory_candidate tests\test_agent_run_controller.py::test_agent_resume_appends_to_existing_run_without_rerunning_iterations tests\test_agent_orchestration_eval.py::test_agent_orchestration_eval_suites_are_listed_and_runnable -q --basetemp=.tmp\agent-review-remediation-selector-green -p no:cacheprovider
+.venv\Scripts\python.exe -m pytest tests\test_agent_run_controller.py tests\test_agent_tool_first_selector.py tests\test_agent_selector_trace.py tests\test_agent_memory_consolidator.py tests\test_agent_memory_relation.py tests\test_agent_effectiveness.py tests\test_agent_worker.py tests\test_agent_orchestration_eval.py tests\test_agent_db_init_stability.py -q --basetemp=.tmp\agent-review-remediation-2-related-rerun2 -p no:cacheprovider
+.venv\Scripts\python.exe -m pytest tests -q --basetemp=.tmp\agent-review-remediation-2-full-rerun2 -p no:cacheprovider
+.venv\Scripts\python.exe -m compileall -q src tests
+.venv\Scripts\agentend.exe eval run agent-replan --home .tmp\agent-review-remediation-2-home-rerun --shared-home
+.venv\Scripts\agentend.exe eval run orchestration-smoke --home .tmp\agent-review-remediation-2-home-rerun
+.venv\Scripts\agentend.exe eval run memory-consolidation --home .tmp\agent-review-remediation-2-home-rerun
+.venv\Scripts\agentend.exe eval run long-task-worker --home .tmp\agent-review-remediation-2-home-rerun
+.venv\Scripts\agentend.exe agent run --home .tmp\agent-review-remediation-2-home-rerun --max-iterations 2 "List the project test command and explain evidence."
+git diff --check
+```
+
+Results:
+- Focused O30-O32 tests: 3 passed.
+- Selector replan regression tests: 3 passed.
+- Related orchestration tests: 28 passed.
+- Closeout resume boundary tests added for completed/cancelled runs.
+- Closeout focused tests: 7 passed.
+- Closeout related orchestration tests: 30 passed.
+- Full suite: 152 passed.
+- Compileall: passed.
+- `agent-replan --shared-home`, `orchestration-smoke`, `memory-consolidation`, and `long-task-worker` evals passed.
+- Normal `agent run` after shared-home `agent-replan` completed with `pytest 8.4.2` output and did not hit the missing fixture.
+- `git diff --check`: exit 0 with CRLF warnings only.

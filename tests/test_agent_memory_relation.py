@@ -5,6 +5,7 @@ from typer.testing import CliRunner
 
 from agentend.cli import app
 from agentend.core.memory_relation import MemoryRelationClassifier
+from agentend.core.memory_relation import MemoryRelationDecision
 from agentend.db.models import MemoryCandidate, MemoryItem, MemoryLink
 from agentend.db.session import session_scope
 
@@ -168,3 +169,52 @@ def test_relation_classifier_uses_structured_llm_decision(tmp_path: Path) -> Non
     assert decision.target_memory_id == old_id
     assert decision.confidence == 0.91
     assert decision.reason == "structured llm update"
+
+
+def test_medium_confidence_update_needs_review_instead_of_active_duplicate(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+    old_id = _write_project_memory(runner, home, "Project test command is pytest -q.")
+    with session_scope(home) as session:
+        session.add(
+            MemoryCandidate(
+                id="candidate-medium-update",
+                type="project_fact",
+                scope="project",
+                content="Project test command is python -m pytest tests -q.",
+                merge_key="project:project_fact:test-command-v2",
+                confidence="0.75",
+                status="pending",
+                tags_json='["subject:test-command", "evidence:test"]',
+            )
+        )
+
+    class MediumUpdateClassifier:
+        def __init__(self, _home):
+            pass
+
+        def classify(self, _session, _candidate):
+            return MemoryRelationDecision(
+                relation="updates",
+                target_memory_id=old_id,
+                confidence=0.75,
+                replacement_content="Project test command is python -m pytest tests -q.",
+                reason="medium-confidence update",
+                evidence_refs=["test-fixture"],
+            )
+
+    monkeypatch.setattr("agentend.core.memory_consolidator.MemoryRelationClassifier", MediumUpdateClassifier)
+
+    consolidated = runner.invoke(app, ["memory", "consolidate", "--home", str(home)])
+
+    assert consolidated.exit_code == 0, consolidated.output
+    assert "needs_review=1" in consolidated.output
+    with session_scope(home) as session:
+        old = session.get(MemoryItem, old_id)
+        candidate = session.get(MemoryCandidate, "candidate-medium-update")
+        active_rows = session.execute(select(MemoryItem).where(MemoryItem.status == "active")).scalars().all()
+        assert old.status == "active"
+        assert candidate.status == "needs_review"
+        assert candidate.memory_id == old_id
+        assert len(active_rows) == 1

@@ -6,6 +6,7 @@ from sqlalchemy import select
 from typer.testing import CliRunner
 
 from agentend.cli import app
+from agentend.core.skills import ensure_builtin_skills
 from agentend.db.models import EvalRun
 from agentend.db.session import session_scope
 
@@ -80,3 +81,38 @@ def test_eval_cli_shared_home_preserves_old_behavior(tmp_path: Path) -> None:
     with session_scope(home) as session:
         row = session.execute(select(EvalRun).where(EvalRun.id == eval_id)).scalar_one()
         assert row.suite == "tool-first"
+
+
+def test_agent_replan_eval_proves_failed_action_then_different_action(tmp_path: Path) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+
+    result = runner.invoke(app, ["eval", "run", "agent-replan", "--home", str(home)])
+
+    assert result.exit_code == 0, result.output
+    payload = _report(runner, home, _eval_id(result.output))
+    case = payload["cases"][0]
+    assert payload["status"] == "passed"
+    assert case["iteration_count"] >= 2
+    assert case["first_action"]["name"]
+    assert case["second_action"]["name"]
+    assert case["first_action"]["name"] != case["second_action"]["name"]
+    assert case["first_observation"]["status"] == "failed"
+
+
+def test_agent_replan_shared_home_restores_builtin_skill_fixture(tmp_path: Path) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+    with session_scope(home) as session:
+        skill = next(row for row in ensure_builtin_skills(home, session) if row.id == "code.local_task")
+        workflow_path = Path(skill.workflow_path)
+    original = workflow_path.read_text(encoding="utf-8")
+
+    result = runner.invoke(app, ["eval", "run", "agent-replan", "--home", str(home), "--shared-home"])
+
+    assert result.exit_code == 0, result.output
+    restored = workflow_path.read_text(encoding="utf-8")
+    assert restored == original
+    assert "__agentend_missing_replan_fixture__" not in restored
