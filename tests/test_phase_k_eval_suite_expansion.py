@@ -109,9 +109,42 @@ def test_runtime_hardening_eval_covers_repaired_runtime_paths(tmp_path: Path, ca
         "skill-tool-usage",
         "model-route-cost",
         "evidence-export",
+        "intent-routing",
     } <= set(cases)
     assert Path(cases["evidence-export"]["export_path"]).exists()
     assert "Future exception was never retrieved" not in caplog.text
+    for case in cases.values():
+        assert case["status"] == "passed"
+        assert case["assertions"]
+        assert all(assertion["status"] == "passed" for assertion in case["assertions"])
+
+
+def test_intent_routing_eval_suite_covers_route_regressions(tmp_path: Path) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+
+    listed = runner.invoke(app, ["eval", "list"])
+    result = runner.invoke(app, ["eval", "run", "intent-routing", "--home", str(home)])
+
+    assert listed.exit_code == 0
+    assert "intent-routing" in listed.output
+    assert result.exit_code == 0, result.output
+    payload = _report(runner, home, _eval_id(result.output))
+    cases = {case["id"]: case for case in payload["cases"]}
+
+    assert payload["suite"] == "intent-routing"
+    assert payload["status"] == "passed"
+    assert {
+        "chat-negative-en",
+        "research-action-zh",
+        "multi-intent-model-en",
+        "missing-input-clarification-en",
+        "prompt-injection-block-en",
+        "similar-tool-confusion-en",
+        "telegram-clarification-binding",
+        "telegram-high-risk-redaction",
+    } <= set(cases)
     for case in cases.values():
         assert case["status"] == "passed"
         assert case["assertions"]

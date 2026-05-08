@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -86,6 +86,29 @@ class AgentEvaluationEvent(Base):
     missing_requirements_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     evidence_refs_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     next_probe: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class IntentDecisionRecord(Base):
+    __tablename__ = "intent_decisions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    conversation_id: Mapped[str | None] = mapped_column(ForeignKey("conversations.id"), nullable=True, index=True)
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("runs.id"), nullable=True, index=True)
+    agent_run_id: Mapped[str | None] = mapped_column(ForeignKey("agent_runs.id"), nullable=True, index=True)
+    channel: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    external_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    input_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    schema_version: Mapped[str] = mapped_column(String(32), default="1", nullable=False)
+    intent_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    risk_level: Mapped[str] = mapped_column(String(32), default="low", nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(64), default="rule", nullable=False, index=True)
+    route_type: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    decision_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    context_summary_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    model_provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 

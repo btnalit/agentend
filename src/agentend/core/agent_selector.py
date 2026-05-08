@@ -62,6 +62,10 @@ def select_next_action_with_trace(
     sync_tool_manifests(session, ToolRegistry(resolved_home).manifests())
     refresh_capabilities(session)
     analysis = goal_analysis or {}
+    intent = _intent_decision(analysis)
+    intent_slots = dict(intent.get("slots", {})) if isinstance(intent.get("slots"), dict) else {}
+    allowed_tools = {str(item) for item in intent.get("allowed_tools", []) if item}
+    allowed_tools_explicit = "allowed_tools" in intent
     previous = previous_observations or []
     failed_names = {
         str(observation.get("action_name"))
@@ -97,35 +101,31 @@ def select_next_action_with_trace(
 
     tool_candidates = _ordered_tool_candidates(session, goal, analysis)
     for tool in tool_candidates:
-        if tool.enabled != "true":
-            candidates.append(
-                _candidate_trace(
-                    "tool_call",
-                    tool.name,
-                    {},
-                    -1.0,
-                    ["tool disabled"],
-                    _tool_input(tool.name, goal),
-                    capability_contract_for("tool_call", tool.name),
-                )
-            )
-            continue
+        input_data = _tool_input(tool.name, goal, intent_slots)
         contract = capability_contract_for("tool_call", tool.name)
-        breakdown, rejected_reasons = _score_tool(
-            session,
-            tool,
-            goal,
-            goal_type,
-            failed_names,
-            analysis,
-            needs_command_probe,
-            requirements,
-            missing_requirements,
-            contract,
-        )
-        candidates.append(
-            _candidate_trace("tool_call", tool.name, breakdown, sum(breakdown.values()), rejected_reasons, _tool_input(tool.name, goal), contract)
-        )
+        if tool.enabled != "true":
+            breakdown: dict[str, float] = {}
+            rejected_reasons = ["tool disabled"]
+            score = -1.0
+        else:
+            breakdown, rejected_reasons = _score_tool(
+                session,
+                tool,
+                goal,
+                goal_type,
+                failed_names,
+                analysis,
+                needs_command_probe,
+                requirements,
+                missing_requirements,
+                contract,
+            )
+            score = sum(breakdown.values())
+        if allowed_tools_explicit and tool.name not in allowed_tools:
+            if "tool not allowed by intent allowed_tools" not in rejected_reasons:
+                rejected_reasons.append("tool not allowed by intent allowed_tools")
+            score = -1.0
+        candidates.append(_candidate_trace("tool_call", tool.name, breakdown, score, rejected_reasons, input_data, contract))
 
     viable = [candidate for candidate in candidates if float(candidate["score"]) > 0]
     if viable:
@@ -164,8 +164,20 @@ def select_next_action_with_trace(
         )
 
     candidates.sort(key=lambda item: (float(item["score"]), str(item["name"])), reverse=True)
+    trace_candidates = candidates[:8]
+    trace_keys = {(item["type"], item["name"]) for item in trace_candidates}
+    for item in candidates[8:]:
+        if "tool not allowed by intent allowed_tools" not in item.get("rejected_reasons", []):
+            continue
+        trace_key = (item["type"], item["name"])
+        if trace_key in trace_keys:
+            continue
+        trace_candidates.append(item)
+        trace_keys.add(trace_key)
+
     trace = {
         "goal_type": goal_type,
+        "intent": intent,
         "selected": {
             "type": selected.type,
             "name": selected.name,
@@ -173,13 +185,19 @@ def select_next_action_with_trace(
             "reason": selected.reason,
         },
         "requirements": requirements,
-        "candidates": candidates[:8],
+        "candidates": trace_candidates,
     }
     return SelectionResult(selected=selected, trace=trace)
 
 
 def _ordered_skill_candidates(session: Session, goal: str, analysis: dict[str, Any]) -> list[Skill]:
-    candidate_ids = [str(item) for item in analysis.get("candidate_skills", []) if item]
+    intent = _intent_decision(analysis)
+    intent_candidates = [
+        str(item.get("name"))
+        for item in intent.get("candidate_actions", [])
+        if isinstance(item, dict) and item.get("type") == "skill_run" and item.get("name")
+    ]
+    candidate_ids = [*intent_candidates, *[str(item) for item in analysis.get("candidate_skills", []) if item]]
     rows = {row.id: row for row in session.execute(select(Skill).order_by(Skill.id)).scalars().all()}
     ordered: list[Skill] = [rows[item] for item in candidate_ids if item in rows]
     lowered = goal.lower()
@@ -199,7 +217,13 @@ def _ordered_skill_candidates(session: Session, goal: str, analysis: dict[str, A
 
 
 def _ordered_tool_candidates(session: Session, goal: str, analysis: dict[str, Any]) -> list[ToolManifest]:
-    candidate_ids = [str(item) for item in analysis.get("candidate_tools", []) if item]
+    intent = _intent_decision(analysis)
+    intent_candidates = [
+        str(item.get("name"))
+        for item in intent.get("candidate_actions", [])
+        if isinstance(item, dict) and item.get("type") == "tool_call" and item.get("name")
+    ]
+    candidate_ids = [*intent_candidates, *[str(item) for item in analysis.get("candidate_tools", []) if item]]
     rows = {row.name: row for row in session.execute(select(ToolManifest).order_by(ToolManifest.name)).scalars().all()}
     ordered: list[ToolManifest] = [rows[item] for item in candidate_ids if item in rows]
     lowered = goal.lower()
@@ -232,6 +256,8 @@ def _score_skill(
     rejected_reasons: list[str] = []
     if skill.id in [str(item) for item in analysis.get("candidate_skills", [])]:
         breakdown["goal_analyzer_candidate"] = 2.0
+    if _intent_candidate_score(analysis, "skill_run", skill.id) > 0:
+        breakdown["intent_candidate"] = 2.5 * _intent_candidate_score(analysis, "skill_run", skill.id)
     if skill.id in failed_names:
         breakdown["previous_iteration_penalty"] = -5.0
         rejected_reasons.append("failed in previous iteration")
@@ -267,6 +293,8 @@ def _score_tool(
     rejected_reasons: list[str] = []
     if tool.name in [str(item) for item in analysis.get("candidate_tools", [])]:
         breakdown["goal_analyzer_candidate"] = 2.0
+    if _intent_candidate_score(analysis, "tool_call", tool.name) > 0:
+        breakdown["intent_candidate"] = 2.5 * _intent_candidate_score(analysis, "tool_call", tool.name)
     if tool.name in failed_names:
         breakdown["previous_iteration_penalty"] = -5.0
         rejected_reasons.append("failed in previous iteration")
@@ -298,6 +326,7 @@ def _base_breakdown(base: float = 2.0) -> dict[str, float]:
         "effectiveness": 0.0,
         "replan_probe": 0.0,
         "requirement_match": 0.0,
+        "intent_candidate": 0.0,
     }
 
 
@@ -406,9 +435,12 @@ def capability_contract_for(action_type: str, name: str) -> dict[str, list[str]]
     }
 
 
-def _tool_input(name: str, goal: str) -> dict[str, Any]:
+def _tool_input(name: str, goal: str, slots: dict[str, Any] | None = None) -> dict[str, Any]:
+    slots = slots or {}
     lowered = goal.lower()
     if name == "fs.read_text":
+        if slots.get("path"):
+            return {"path": str(slots["path"])}
         if "readme" in lowered:
             return {"path": "README.md"}
         if "agent" in lowered:
@@ -431,6 +463,25 @@ def _tool_input(name: str, goal: str) -> dict[str, Any]:
     if name == "tools.discover":
         return {"query": goal}
     return {"input": goal}
+
+
+def _intent_decision(analysis: dict[str, Any]) -> dict[str, Any]:
+    payload = analysis.get("intent_decision")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _intent_candidate_score(analysis: dict[str, Any], action_type: str, name: str) -> float:
+    intent = _intent_decision(analysis)
+    for item in intent.get("candidate_actions", []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != action_type or item.get("name") != name:
+            continue
+        try:
+            return float(item.get("score", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
 
 
 def _goal_type(goal: str, analysis: dict[str, Any]) -> str:

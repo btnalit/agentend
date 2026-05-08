@@ -26,7 +26,7 @@ from agentend.core.tool_contracts import snapshot_tool_contracts, sync_tool_mani
 from agentend.core.tool_registry import ToolRegistry
 from agentend.core.workflow_registry import WorkflowRegistry
 from agentend.core.workflow_schema import WorkflowDefinition, WorkflowNode
-from agentend.db.models import Checkpoint, ContextLedger, Conversation, CostBudget, Run, RunStep, WorkflowDef
+from agentend.db.models import AgentRun, Checkpoint, ContextLedger, Conversation, CostBudget, Run, RunStep, WorkflowDef, utc_now
 from agentend.db.session import init_database, session_scope
 from agentend.tools.base import ToolContext
 
@@ -175,63 +175,71 @@ class WorkflowRunner:
                 conversation is None or conversation.external_user_id != expected_external_user_id
             ):
                 raise ValueError("Run does not belong to this external user")
-            if run.workflow_id is None:
-                raise ValueError("Run has no workflow_id and cannot be resumed")
-            workflow = WorkflowRegistry(config).get(run.workflow_id)
-            user_input = str(json.loads(run.input_json).get("input", ""))
-            outputs = self._completed_outputs_for_workflow(session, run_id, workflow)
-            start_after_node: str | None = None
-
-            if answer is not None:
-                request = pending_clarification_for_run(session, run_id)
-                if request is None:
-                    raise ValueError(f"Run has no pending clarification: {run_id}")
-                expires_at = request.expires_at
-                if expires_at is not None and expires_at.tzinfo is None:
-                    expires_at = expires_at.replace(tzinfo=timezone.utc)
-                if expires_at is not None and expires_at <= datetime.now(timezone.utc):
-                    request.status = "expired"
-                    record_event(session, "clarification.expired", {"request_id": request.id}, run_id=run.id)
-                    resume_error = ValueError("Clarification request expired")
+            if run.workflow_id == "intent.clarification":
+                if checkpoint_id is not None:
+                    resume_error = ValueError("Intent clarification runs can only resume with an answer")
+                elif answer is None:
+                    resume_error = ValueError("Provide --answer for an intent clarification")
                 else:
-                    answer_clarification(session, request, answer)
-                    step = session.get(RunStep, request.step_id)
-                    if step is None:
-                        raise ValueError(f"Clarification step is missing: {request.step_id}")
-                    step.status = "completed"
-                    step.output_json = json.dumps({"content": answer}, ensure_ascii=False)
-                    step.error = None
-                    outputs[step.node_id] = answer
-                    create_checkpoint(session, run_id=run_id, step=step, output=answer)
-                    start_after_node = step.node_id
-            elif checkpoint_id is not None:
-                checkpoint = session.get(Checkpoint, checkpoint_id)
-                if checkpoint is None:
-                    raise ValueError(f"Unknown checkpoint: {checkpoint_id}")
-                if checkpoint.run_id != run_id:
-                    raise ValueError("Checkpoint does not belong to this run")
-                start_after_node = checkpoint.node_id
-                outputs = self._completed_outputs_for_workflow(session, run_id, workflow, stop_node_id=start_after_node)
+                    result = self._resume_intent_clarification(session, run, answer)
+            if result is None and resume_error is None:
+                if run.workflow_id is None:
+                    raise ValueError("Run has no workflow_id and cannot be resumed")
+                workflow = WorkflowRegistry(config).get(run.workflow_id)
+                user_input = str(json.loads(run.input_json).get("input", ""))
+                outputs = self._completed_outputs_for_workflow(session, run_id, workflow)
+                start_after_node: str | None = None
 
-            if resume_error is None:
-                run.status = "running"
-                run.error = None
-                record_event(session, "run.resumed", {"checkpoint_id": checkpoint_id, "answered": answer is not None}, run_id=run.id)
-                try:
-                    result = self._continue_existing_run(
-                        session=session,
-                        run=run,
-                        workflow=workflow,
-                        user_input=user_input,
-                        outputs=outputs,
-                        start_after_node=start_after_node,
-                        llm=llm,
-                        tools=tools,
-                        run_mode=run_mode,
-                    )
-                except Exception as exc:
-                    self._mark_run_failed(session, run, workflow, user_input, start_after_node or "", exc)
-                    failure = WorkflowRunFailed(run.id, str(exc))
+                if answer is not None:
+                    request = pending_clarification_for_run(session, run_id)
+                    if request is None:
+                        raise ValueError(f"Run has no pending clarification: {run_id}")
+                    expires_at = request.expires_at
+                    if expires_at is not None and expires_at.tzinfo is None:
+                        expires_at = expires_at.replace(tzinfo=timezone.utc)
+                    if expires_at is not None and expires_at <= datetime.now(timezone.utc):
+                        request.status = "expired"
+                        record_event(session, "clarification.expired", {"request_id": request.id}, run_id=run.id)
+                        resume_error = ValueError("Clarification request expired")
+                    else:
+                        answer_clarification(session, request, answer)
+                        step = session.get(RunStep, request.step_id)
+                        if step is None:
+                            raise ValueError(f"Clarification step is missing: {request.step_id}")
+                        step.status = "completed"
+                        step.output_json = json.dumps({"content": answer}, ensure_ascii=False)
+                        step.error = None
+                        outputs[step.node_id] = answer
+                        create_checkpoint(session, run_id=run_id, step=step, output=answer)
+                        start_after_node = step.node_id
+                elif checkpoint_id is not None:
+                    checkpoint = session.get(Checkpoint, checkpoint_id)
+                    if checkpoint is None:
+                        raise ValueError(f"Unknown checkpoint: {checkpoint_id}")
+                    if checkpoint.run_id != run_id:
+                        raise ValueError("Checkpoint does not belong to this run")
+                    start_after_node = checkpoint.node_id
+                    outputs = self._completed_outputs_for_workflow(session, run_id, workflow, stop_node_id=start_after_node)
+
+                if resume_error is None:
+                    run.status = "running"
+                    run.error = None
+                    record_event(session, "run.resumed", {"checkpoint_id": checkpoint_id, "answered": answer is not None}, run_id=run.id)
+                    try:
+                        result = self._continue_existing_run(
+                            session=session,
+                            run=run,
+                            workflow=workflow,
+                            user_input=user_input,
+                            outputs=outputs,
+                            start_after_node=start_after_node,
+                            llm=llm,
+                            tools=tools,
+                            run_mode=run_mode,
+                        )
+                    except Exception as exc:
+                        self._mark_run_failed(session, run, workflow, user_input, start_after_node or "", exc)
+                        failure = WorkflowRunFailed(run.id, str(exc))
 
         if resume_error is not None:
             raise resume_error
@@ -239,6 +247,43 @@ class WorkflowRunner:
             raise failure
         assert result is not None
         return result
+
+    def _resume_intent_clarification(self, session: Session, run: Run, answer: str) -> WorkflowRunResult:
+        request = pending_clarification_for_run(session, run.id)
+        if request is None:
+            raise ValueError(f"Run has no pending clarification: {run.id}")
+        answer_clarification(session, request, answer)
+        step = session.get(RunStep, request.step_id)
+        if step is None:
+            raise ValueError(f"Clarification step is missing: {request.step_id}")
+        step.status = "completed"
+        step.output_json = json.dumps({"content": answer}, ensure_ascii=False, sort_keys=True)
+        step.error = None
+        create_checkpoint(session, run_id=run.id, step=step, output=answer)
+        payload = _json_payload(run.result_json)
+        input_payload = _json_payload(run.input_json)
+        content = f"已收到补充信息：{answer}"
+        payload["content"] = content
+        payload["clarification_answer"] = answer
+        run.status = "completed"
+        run.error = None
+        run.result_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        agent_run_id = str(payload.get("agent_run_id") or input_payload.get("agent_run_id") or "")
+        if agent_run_id:
+            agent_run = session.get(AgentRun, agent_run_id)
+            if agent_run is not None:
+                agent_run.status = "completed"
+                agent_run.stop_reason = "clarification_answered"
+                agent_run.completed_at = utc_now()
+                agent_run.heartbeat_at = utc_now()
+                agent_run.final_result_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        record_event(
+            session,
+            "intent.clarification_answered",
+            {"request_id": request.id, "agent_run_id": agent_run_id},
+            run_id=run.id,
+        )
+        return WorkflowRunResult(run_id=run.id, output=content)
 
     def _run_node(
         self,
@@ -702,3 +747,13 @@ class WorkflowRunner:
     def _workflow_id_for_run(self, session: Session, run_id: str) -> str | None:
         run = session.get(Run, run_id)
         return run.workflow_id if run is not None else None
+
+
+def _json_payload(raw: str | None) -> dict:
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}

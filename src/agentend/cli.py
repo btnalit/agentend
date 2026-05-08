@@ -24,6 +24,8 @@ from agentend.core.effectiveness import effectiveness_rows, effectiveness_summar
 from agentend.core.eval_harness import list_eval_suites, run_eval_suite
 from agentend.core.goal_analyzer import analyze_goal, goal_analysis_text
 from agentend.core.init import initialize_home
+from agentend.core.intent_audit import intent_record_to_dict, record_intent_decision
+from agentend.core.intent_router import decide_intent
 from agentend.core.llm_router import LLMRouter
 from agentend.core.memory_consolidator import (
     consolidate_memory_candidates,
@@ -76,6 +78,7 @@ from agentend.db.models import (
     EventLog,
     ExtensionRecord,
     ExtensionVersion,
+    IntentDecisionRecord,
     MemoryItem,
     Message,
     ProjectProfile,
@@ -134,6 +137,7 @@ capabilities_app = typer.Typer(help="Capability map commands.", no_args_is_help=
 capability_effectiveness_app = typer.Typer(help="Capability effectiveness commands.", no_args_is_help=True)
 sources_app = typer.Typer(help="Source evidence commands.", no_args_is_help=True)
 goal_app = typer.Typer(help="Goal analysis commands.", no_args_is_help=True)
+intent_app = typer.Typer(help="Intent routing debug commands.", no_args_is_help=True)
 plan_app = typer.Typer(help="Planning recovery commands.", no_args_is_help=True)
 episodes_app = typer.Typer(help="Episode logger commands.", no_args_is_help=True)
 inbox_app = typer.Typer(help="File inbox commands.", no_args_is_help=True)
@@ -173,6 +177,7 @@ app.add_typer(capabilities_app, name="capabilities")
 capabilities_app.add_typer(capability_effectiveness_app, name="effectiveness")
 app.add_typer(sources_app, name="sources")
 app.add_typer(goal_app, name="goal")
+app.add_typer(intent_app, name="intent")
 app.add_typer(plan_app, name="plan")
 app.add_typer(episodes_app, name="episodes")
 app.add_typer(inbox_app, name="inbox")
@@ -247,6 +252,101 @@ def goal_analyze(
         sync_tool_manifests(session, ToolRegistry(resolved_home).manifests())
         payload = analyze_goal(resolved_home, session, text)
         typer.echo(goal_analysis_text(payload))
+
+
+@intent_app.command("decide")
+def intent_decide(
+    text: str,
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
+) -> None:
+    """Decide the structured intent route for one input."""
+    resolved_home = (home or Path.cwd()).expanduser().resolve()
+    init_database(resolved_home)
+    with session_scope(resolved_home) as session:
+        decision = decide_intent(resolved_home, session, text)
+        row = record_intent_decision(
+            resolved_home,
+            session,
+            text,
+            decision,
+            channel="cli",
+            external_user_id="local",
+            route_type="debug",
+            context_summary={"source": "cli.intent_decide", "text_length": len(text)},
+        )
+        payload = json.loads(row.decision_json)
+        payload["intent_decision_id"] = row.id
+    if json_output:
+        typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return
+    typer.echo(f"IntentDecision: {payload['intent_decision_id']}")
+    typer.echo(f"Intent: {payload.get('intent_type')}  confidence={payload.get('confidence')}  risk={payload.get('risk_level')}")
+    if payload.get("clarification_question"):
+        typer.echo(f"Clarification: {payload['clarification_question']}")
+    typer.echo(f"Reason: {payload.get('routing_reason') or '-'}")
+
+
+@intent_app.command("show")
+def intent_show(
+    intent_decision_id: str,
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
+) -> None:
+    """Show one persisted intent decision."""
+    resolved_home = (home or Path.cwd()).expanduser().resolve()
+    init_database(resolved_home)
+    with session_scope(resolved_home) as session:
+        row = session.get(IntentDecisionRecord, intent_decision_id)
+        if row is None:
+            raise typer.BadParameter(f"unknown intent decision: {intent_decision_id}")
+        payload = intent_record_to_dict(row)
+    if json_output:
+        typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return
+    typer.echo(f"IntentDecision: {payload['id']}")
+    typer.echo(f"Intent: {payload['intent_type']}  confidence={payload['confidence']}  risk={payload['risk_level']}")
+    typer.echo(f"Source: {payload['source']}  route={payload.get('route_type') or '-'}")
+    typer.echo(f"Created: {payload['created_at']}")
+
+
+@intent_app.command("list")
+def intent_list(
+    home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
+    conversation_id: Optional[str] = typer.Option(None, "--conversation", help="Filter by conversation id."),
+    run_id: Optional[str] = typer.Option(None, "--run", help="Filter by run id."),
+    agent_run_id: Optional[str] = typer.Option(None, "--agent-run", help="Filter by agent run id."),
+    limit: int = typer.Option(20, "--limit", min=1, max=200, help="Maximum rows to show."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
+) -> None:
+    """List persisted intent decisions."""
+    resolved_home = (home or Path.cwd()).expanduser().resolve()
+    init_database(resolved_home)
+    with session_scope(resolved_home) as session:
+        query = select(IntentDecisionRecord)
+        if conversation_id:
+            query = query.where(IntentDecisionRecord.conversation_id == conversation_id)
+        if run_id:
+            query = query.where(IntentDecisionRecord.run_id == run_id)
+        if agent_run_id:
+            query = query.where(IntentDecisionRecord.agent_run_id == agent_run_id)
+        rows = (
+            session.execute(query.order_by(IntentDecisionRecord.created_at.desc()).limit(limit))
+            .scalars()
+            .all()
+        )
+        payload = [intent_record_to_dict(row) for row in rows]
+    if json_output:
+        typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return
+    if not payload:
+        typer.echo("No intent decisions.")
+        return
+    for row in payload:
+        typer.echo(
+            f"{row['created_at']}  {row['id']}  {row['intent_type']}  "
+            f"risk={row['risk_level']}  source={row['source']}  route={row.get('route_type') or '-'}"
+        )
 
 
 @plan_app.command("replan")
@@ -1394,6 +1494,15 @@ def runs_export(
         )
         contract_payload = [snapshot_to_dict(snapshot) for snapshot in contract_snapshots]
         evidence_manifest = evidence_manifest_for_run(session, resolved_home, run_id)
+        intent_decisions = (
+            session.execute(
+                select(IntentDecisionRecord)
+                .where(IntentDecisionRecord.run_id == run_id)
+                .order_by(IntentDecisionRecord.created_at)
+            )
+            .scalars()
+            .all()
+        )
         payload = {
             "run": {"id": run.id, "status": run.status, "workflow_id": run.workflow_id, "error": run.error},
             "steps": [{"id": step.id, "node_id": step.node_id, "status": step.status, "error": step.error} for step in steps],
@@ -1403,6 +1512,7 @@ def runs_export(
             ],
             "tool_contract_snapshots": contract_payload,
             "artifacts": [{"id": artifact.id, "path": artifact.path, "kind": artifact.kind} for artifact in artifacts],
+            "intent_decisions": [intent_record_to_dict(row) for row in intent_decisions],
             "evidence_manifest": evidence_manifest,
         }
         (export_root / "run.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1779,7 +1889,11 @@ def chat(
             typer.echo(result.content)
             return
         response = service.handle_message("cli", "local", message)
-        typer.echo(f"Run: {response.run_id}")
+        if response.run_id:
+            typer.echo(f"Run: {response.run_id}")
+        if response.agent_run_id:
+            typer.echo(f"AgentRun: {response.agent_run_id}")
+            typer.echo(f"Status: {response.status}")
         typer.echo(response.content)
         return
 
@@ -1794,7 +1908,11 @@ def chat(
             typer.echo(result.content)
             continue
         response = service.handle_message("cli", "local", text)
-        typer.echo(f"Run: {response.run_id}")
+        if response.run_id:
+            typer.echo(f"Run: {response.run_id}")
+        if response.agent_run_id:
+            typer.echo(f"AgentRun: {response.agent_run_id}")
+            typer.echo(f"Status: {response.status}")
         typer.echo(response.content)
 
 

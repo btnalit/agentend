@@ -13,8 +13,11 @@ from sqlalchemy import select
 from agentend.config import load_config
 from agentend.core.agent_evaluator import evaluate_goal_observation
 from agentend.core.agent_selector import SelectedAction, select_next_action_with_trace
+from agentend.core.clarifications import create_clarification_request
 from agentend.core.effectiveness import record_effectiveness_event
+from agentend.core.events import record_event
 from agentend.core.goal_analyzer import analyze_goal
+from agentend.core.intent_audit import record_intent_decision
 from agentend.core.memory_consolidator import consolidate_memory_candidates
 from agentend.core.memory_store import search_memory_items
 from agentend.core.skills import ensure_builtin_skills
@@ -83,9 +86,12 @@ class AgentRunController:
             run_mode=run_mode,
             conversation_id=conversation_id,
         )
+        agent_run_id = self._start_run(request)
+        gated_result = self._initial_intent_gate(request, agent_run_id=agent_run_id)
+        if gated_result is not None:
+            return gated_result
         if not request.goal:
             raise ValueError("Agent goal must not be empty")
-        agent_run_id = self._start_run(request)
         return self._run_loop(
             request,
             agent_run_id=agent_run_id,
@@ -159,6 +165,18 @@ class AgentRunController:
                 agent_run = session.get(AgentRun, agent_run_id)
                 assert agent_run is not None
                 goal_analysis = analyze_goal(self.home, session, request.goal)
+                intent_record = record_intent_decision(
+                    self.home,
+                    session,
+                    request.goal,
+                    goal_analysis.get("intent_decision", {}),
+                    conversation_id=agent_run.conversation_id,
+                    agent_run_id=agent_run_id,
+                    channel=request.channel,
+                    external_user_id=request.external_user_id,
+                    route_type="agent_iteration",
+                    context_summary={"source": "agent_run.loop", "iteration_index": iteration_index},
+                )
                 memories = search_memory_items(session, request.goal, limit=5)
                 selection = select_next_action_with_trace(
                     self.home,
@@ -170,6 +188,7 @@ class AgentRunController:
                 selected = selection.selected
                 plan = {
                     "goal_analysis": goal_analysis,
+                    "intent_decision_id": intent_record.id,
                     "memory_ids": [memory.id for memory in memories],
                     "memory_summaries": [memory.content[:240] for memory in memories],
                     "previous_observations": previous_observations,
@@ -371,6 +390,199 @@ class AgentRunController:
             )
             session.add(row)
             return row.id
+
+    def _initial_intent_gate(self, request: AgentRunRequest, *, agent_run_id: str) -> AgentRunResult | None:
+        with session_scope(self.home) as session:
+            goal_analysis = analyze_goal(self.home, session, request.goal)
+            intent = goal_analysis.get("intent_decision")
+            if not isinstance(intent, dict):
+                return None
+            intent_type = str(intent.get("intent_type") or "")
+            missing_inputs = [str(item) for item in intent.get("missing_inputs") or []]
+            if intent_type == "blocked":
+                return self._record_blocked_intent(
+                    session,
+                    request,
+                    agent_run_id=agent_run_id,
+                    goal_analysis=goal_analysis,
+                    intent=intent,
+                )
+            if intent_type == "clarification" or missing_inputs:
+                return self._record_clarification_intent(
+                    session,
+                    request,
+                    agent_run_id=agent_run_id,
+                    goal_analysis=goal_analysis,
+                    intent=intent,
+                    missing_inputs=missing_inputs,
+                )
+        return None
+
+    def _record_clarification_intent(
+        self,
+        session,
+        request: AgentRunRequest,
+        *,
+        agent_run_id: str,
+        goal_analysis: dict[str, Any],
+        intent: dict[str, Any],
+        missing_inputs: list[str],
+    ) -> AgentRunResult:
+        agent_run = session.get(AgentRun, agent_run_id)
+        assert agent_run is not None
+        question = str(intent.get("clarification_question") or _clarification_question(missing_inputs))
+        run = Run(
+            id=str(uuid4()),
+            conversation_id=agent_run.conversation_id,
+            workflow_id="intent.clarification",
+            status="waiting_input",
+            input_json=json.dumps(
+                {
+                    "input": request.goal,
+                    "agent_run_id": agent_run_id,
+                    "missing_inputs": missing_inputs,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            result_json="{}",
+        )
+        step = RunStep(
+            id=str(uuid4()),
+            run_id=run.id,
+            node_id="intent.clarification",
+            status="waiting_input",
+            input_json=json.dumps({"goal": request.goal, "intent_decision": intent}, ensure_ascii=False, sort_keys=True),
+            output_json=json.dumps({"prompt": question}, ensure_ascii=False, sort_keys=True),
+        )
+        session.add(run)
+        session.add(step)
+        session.flush()
+        clarification = create_clarification_request(
+            session,
+            run_id=run.id,
+            step_id=step.id,
+            request_type=_clarification_request_type(missing_inputs),
+            question=question,
+            reason=str(intent.get("routing_reason") or ""),
+        )
+        payload = {
+            "content": question,
+            "agent_run_id": agent_run_id,
+            "clarification_request_id": clarification.id,
+            "goal_analysis": goal_analysis,
+            "intent_decision": intent,
+            "linked_run_id": run.id,
+            "missing_inputs": missing_inputs,
+        }
+        intent_record = record_intent_decision(
+            self.home,
+            session,
+            request.goal,
+            intent,
+            conversation_id=agent_run.conversation_id,
+            run_id=run.id,
+            agent_run_id=agent_run_id,
+            channel=request.channel,
+            external_user_id=request.external_user_id,
+            route_type="clarification",
+            context_summary={"source": "agent_run.gate", "missing_inputs": missing_inputs},
+        )
+        payload["intent_decision_id"] = intent_record.id
+        run.result_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        agent_run.status = "waiting_input"
+        agent_run.stop_reason = "clarification_required"
+        agent_run.final_result_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        agent_run.heartbeat_at = utc_now()
+        record_event(
+            session,
+            "agent.intent_clarification_required",
+            {"agent_run_id": agent_run_id, "run_id": run.id, "missing_inputs": missing_inputs},
+            run_id=run.id,
+        )
+        return AgentRunResult(
+            agent_run_id=agent_run_id,
+            status="waiting_input",
+            stop_reason="clarification_required",
+            content=question,
+            linked_run_id=run.id,
+        )
+
+    def _record_blocked_intent(
+        self,
+        session,
+        request: AgentRunRequest,
+        *,
+        agent_run_id: str,
+        goal_analysis: dict[str, Any],
+        intent: dict[str, Any],
+    ) -> AgentRunResult:
+        agent_run = session.get(AgentRun, agent_run_id)
+        assert agent_run is not None
+        reason = str(intent.get("routing_reason") or "high-risk intent")
+        content = f"已阻止该请求：{reason}"
+        run = Run(
+            id=str(uuid4()),
+            conversation_id=agent_run.conversation_id,
+            workflow_id="intent.blocked",
+            status="blocked",
+            input_json=json.dumps({"input": request.goal, "agent_run_id": agent_run_id}, ensure_ascii=False, sort_keys=True),
+            result_json="{}",
+            error=reason,
+        )
+        step = RunStep(
+            id=str(uuid4()),
+            run_id=run.id,
+            node_id="intent.blocked",
+            status="blocked",
+            input_json=json.dumps({"goal": request.goal, "intent_decision": intent}, ensure_ascii=False, sort_keys=True),
+            output_json=json.dumps({"content": content}, ensure_ascii=False, sort_keys=True),
+            error=reason,
+        )
+        session.add(run)
+        session.add(step)
+        payload = {
+            "content": content,
+            "agent_run_id": agent_run_id,
+            "goal_analysis": goal_analysis,
+            "intent_decision": intent,
+            "linked_run_id": run.id,
+            "risk_level": intent.get("risk_level"),
+            "risk_notes": intent.get("risk_notes") or [],
+        }
+        intent_record = record_intent_decision(
+            self.home,
+            session,
+            request.goal,
+            intent,
+            conversation_id=agent_run.conversation_id,
+            run_id=run.id,
+            agent_run_id=agent_run_id,
+            channel=request.channel,
+            external_user_id=request.external_user_id,
+            route_type="blocked",
+            context_summary={"source": "agent_run.gate", "blocked_reason": reason},
+        )
+        payload["intent_decision_id"] = intent_record.id
+        run.result_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        agent_run.status = "blocked"
+        agent_run.stop_reason = "intent_blocked"
+        agent_run.completed_at = utc_now()
+        agent_run.heartbeat_at = utc_now()
+        agent_run.final_result_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        record_event(
+            session,
+            "agent.intent_blocked",
+            {"agent_run_id": agent_run_id, "run_id": run.id, "reason": reason},
+            run_id=run.id,
+        )
+        return AgentRunResult(
+            agent_run_id=agent_run_id,
+            status="blocked",
+            stop_reason="intent_blocked",
+            content=content,
+            linked_run_id=run.id,
+        )
 
     def _execute_action(
         self,
@@ -695,6 +907,26 @@ def _result_from_agent_run(row: AgentRun) -> AgentRunResult:
         linked_run_id=str(final_result.get("linked_run_id") or "") or None,
         progress_artifact_id=str(final_result.get("progress_artifact_id") or "") or None,
     )
+
+
+def _clarification_question(missing_inputs: list[str]) -> str:
+    if "path" in missing_inputs:
+        return "请提供要写入的文件路径。"
+    if "content" in missing_inputs:
+        return "请提供要写入的内容。"
+    if "risk_confirmation" in missing_inputs:
+        return "该请求风险较高。请确认目标、范围和允许的操作。"
+    if "goal" in missing_inputs:
+        return "What goal should AgentEnd work on?"
+    return "请补充完成该目标所需的信息。"
+
+
+def _clarification_request_type(missing_inputs: list[str]) -> str:
+    if "risk_confirmation" in missing_inputs:
+        return "risk_confirmation"
+    if missing_inputs:
+        return "missing_input"
+    return "ambiguous_goal"
 
 
 def _previous_observations_from_iterations(iterations: list[AgentIteration]) -> list[dict[str, Any]]:

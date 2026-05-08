@@ -9,7 +9,15 @@ from sqlalchemy.orm import Session
 from agentend.config import AppConfig, load_config
 from agentend.db.models import CostBudget, CostUsage, ModelRoute
 
-DEFAULT_STAGES = ["goal_analyze", "context_compact", "workflow_step", "replan", "vision", "final_evaluate"]
+DEFAULT_STAGES = [
+    "goal_analyze",
+    "intent_classify",
+    "context_compact",
+    "workflow_step",
+    "replan",
+    "vision",
+    "final_evaluate",
+]
 
 
 @dataclass(frozen=True)
