@@ -16,6 +16,10 @@ base_url = ""
 api_key_env = "OPENAI_API_KEY"
 base_url = "https://api.openai.com/v1"
 
+[llm.providers.deepseek]
+api_key_env = "DEEPSEEK_API_KEY"
+base_url = "https://api.deepseek.com"
+
 [telegram]
 enabled = false
 bot_token_env = "TELEGRAM_BOT_TOKEN"
@@ -59,6 +63,7 @@ workflow_dir = "./workflows/definitions"
 
 
 DEFAULT_ENV_EXAMPLE = """OPENAI_API_KEY=
+DEEPSEEK_API_KEY=
 TELEGRAM_BOT_TOKEN=
 BRAVE_SEARCH_API_KEY=
 GEMINI_API_KEY=

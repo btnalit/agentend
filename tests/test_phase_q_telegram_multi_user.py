@@ -224,6 +224,20 @@ nodes:
     assert "Output omitted from Telegram" in raw_tool_reply
 
 
+def test_telegram_plain_agent_message_omits_raw_tool_json(tmp_path: Path) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+    router = TelegramMessageRouter(home)
+
+    reply = router.handle_text("chat-plain-tool", "user-plain-tool", "运行测试")
+
+    assert "Run:" in reply
+    assert "Output omitted from Telegram" in reply
+    assert "exit_code" not in reply
+    assert "stderr" not in reply
+
+
 def _write_ask_workflow(home: Path) -> None:
     (home / "workflows" / "definitions" / "ask_bound.yaml").write_text(
         """id: ask_bound

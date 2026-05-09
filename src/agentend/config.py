@@ -15,6 +15,13 @@ class LLMProviderConfig:
     base_url: str
 
 
+LLM_PROVIDER_PRESETS = {
+    "fake": LLMProviderConfig(api_key_env="", base_url=""),
+    "openai": LLMProviderConfig(api_key_env="OPENAI_API_KEY", base_url="https://api.openai.com/v1"),
+    "deepseek": LLMProviderConfig(api_key_env="DEEPSEEK_API_KEY", base_url="https://api.deepseek.com"),
+}
+
+
 @dataclass(frozen=True)
 class LLMConfig:
     provider: str
@@ -93,11 +100,11 @@ def load_config(home: Path) -> AppConfig:
         for name, provider_raw in providers.items()
         if isinstance(provider_raw, dict)
     }
-    provider_configs.setdefault("fake", LLMProviderConfig(api_key_env="", base_url=""))
-    provider_configs.setdefault("openai", LLMProviderConfig(api_key_env="OPENAI_API_KEY", base_url="https://api.openai.com/v1"))
+    provider_configs.setdefault("fake", LLM_PROVIDER_PRESETS["fake"])
+    provider_configs.setdefault("openai", LLM_PROVIDER_PRESETS["openai"])
     provider_config = provider_configs.get(
         provider,
-        LLMProviderConfig(api_key_env=f"{provider.upper()}_API_KEY", base_url="https://api.openai.com/v1"),
+        _default_llm_provider_config(provider),
     )
     llm = LLMConfig(
         provider=provider,
@@ -167,26 +174,25 @@ def load_config(home: Path) -> AppConfig:
     return AppConfig(home=resolved_home, llm=llm, data=data, search=search, vision=vision)
 
 
-def set_llm_config(home: Path, provider: str, model: str) -> AppConfig:
+def set_llm_config(home: Path, provider: str, model: str, *, api_key_env: str | None = None, base_url: str | None = None) -> AppConfig:
     config = load_config(home)
     config_path = config.home / "config.toml"
-    provider_config = config.llm.provider_config
-    if provider == "fake":
-        next_provider_config = {"api_key_env": "", "base_url": ""}
-    elif provider == config.llm.provider:
-        next_provider_config = {
-            "api_key_env": provider_config.api_key_env,
-            "base_url": provider_config.base_url,
-        }
-    else:
-        next_provider_config = {
-            "api_key_env": f"{provider.upper()}_API_KEY",
-            "base_url": "https://api.openai.com/v1",
-        }
     providers = {
         name: {"api_key_env": item.api_key_env, "base_url": item.base_url}
         for name, item in config.llm.providers.items()
     }
+    existing = config.llm.providers.get(provider)
+    provider_config = existing or _default_llm_provider_config(provider)
+    next_provider_config = {
+        "api_key_env": provider_config.api_key_env,
+        "base_url": provider_config.base_url,
+    }
+    if api_key_env is not None:
+        next_provider_config["api_key_env"] = api_key_env
+    if base_url is not None:
+        next_provider_config["base_url"] = base_url
+    if provider == "fake":
+        next_provider_config = {"api_key_env": "", "base_url": ""}
     providers[provider] = next_provider_config
     raw = {
         "llm": {
@@ -224,6 +230,13 @@ def set_llm_config(home: Path, provider: str, model: str) -> AppConfig:
     }
     config_path.write_text(_dump_toml(raw), encoding="utf-8")
     return load_config(home)
+
+
+def _default_llm_provider_config(provider: str) -> LLMProviderConfig:
+    preset = LLM_PROVIDER_PRESETS.get(provider)
+    if preset is not None:
+        return preset
+    return LLMProviderConfig(api_key_env=f"{provider.upper()}_API_KEY", base_url="https://api.openai.com/v1")
 
 
 def _dump_toml(raw: dict[str, Any]) -> str:

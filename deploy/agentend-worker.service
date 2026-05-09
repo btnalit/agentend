@@ -1,0 +1,13 @@
+[Unit]
+Description=AgentEnd Worker
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/agentend
+EnvironmentFile=-/opt/agentend/.env
+ExecStart=/opt/agentend/.venv/bin/agentend serve --home /opt/agentend
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

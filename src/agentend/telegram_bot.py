@@ -98,7 +98,7 @@ class TelegramMessageRouter:
             external_user_id=external_user_id,
             text=text,
         )
-        return self._run_reply(response.run_id, response.content, omit_raw_tool_output=False)
+        return self._run_reply(response.run_id, response.content)
 
     def _pending_telegram_run_id(self, external_user_id: str) -> str | None:
         with session_scope(self.home) as session:

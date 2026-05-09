@@ -1959,11 +1959,17 @@ def llm_list(
 def llm_set(
     provider: str = typer.Option(..., "--provider", help="Provider name."),
     model: str = typer.Option(..., "--model", help="Model name."),
+    base_url: Optional[str] = typer.Option(None, "--base-url", help="OpenAI-compatible base URL."),
+    api_key_env: Optional[str] = typer.Option(None, "--api-key-env", help="Environment variable that stores the provider API key."),
     home: Optional[Path] = typer.Option(None, "--home", "-H", help="AgentEnd home directory."),
 ) -> None:
     """Set the active LLM provider and model."""
-    config = set_llm_config(home or Path.cwd(), provider=provider, model=model)
+    config = set_llm_config(home or Path.cwd(), provider=provider, model=model, base_url=base_url, api_key_env=api_key_env)
     typer.echo(f"LLM set: {config.llm.provider}/{config.llm.model}")
+    if config.llm.provider_config.api_key_env:
+        typer.echo(f"API key env: {config.llm.provider_config.api_key_env}")
+    if config.llm.provider_config.base_url:
+        typer.echo(f"Base URL: {config.llm.provider_config.base_url}")
 
 
 @llm_app.command("current")

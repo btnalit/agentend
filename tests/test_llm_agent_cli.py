@@ -30,6 +30,41 @@ def test_llm_config_can_be_set_and_reported(tmp_path: Path) -> None:
     assert "gpt-4.1-mini" in current.output
 
 
+def test_llm_set_accepts_openai_compatible_provider_endpoint_and_env(tmp_path: Path) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+
+    result = runner.invoke(
+        app,
+        [
+            "llm",
+            "set",
+            "--home",
+            str(home),
+            "--provider",
+            "deepseek",
+            "--model",
+            "deepseek-v4-flash",
+            "--base-url",
+            "https://api.deepseek.com",
+            "--api-key-env",
+            "DEEPSEEK_API_KEY",
+        ],
+    )
+    current = runner.invoke(app, ["llm", "current", "--home", str(home)])
+    config_text = (home / "config.toml").read_text(encoding="utf-8")
+
+    assert result.exit_code == 0
+    assert "DEEPSEEK_API_KEY" in result.output
+    assert "https://api.deepseek.com" in result.output
+    assert current.exit_code == 0
+    assert "Provider: deepseek" in current.output
+    assert "API key env: DEEPSEEK_API_KEY" in current.output
+    assert "[llm.providers.deepseek]" in config_text
+    assert 'base_url = "https://api.deepseek.com"' in config_text
+
+
 def test_llm_test_reports_missing_api_key(tmp_path: Path, monkeypatch) -> None:
     home = tmp_path / "agentend-home"
     runner = CliRunner()

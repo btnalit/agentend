@@ -30,12 +30,12 @@ agentend chat --message "你好"
 
 ```bash
 cp .env.example .env
-# 编辑 .env，写入 OPENAI_API_KEY
-agentend llm set --provider openai --model gpt-4.1
+# 编辑 .env，写入 DEEPSEEK_API_KEY 或 OPENAI_API_KEY
+agentend llm set --provider deepseek --model deepseek-v4-flash --base-url https://api.deepseek.com --api-key-env DEEPSEEK_API_KEY
 agentend llm test
 ```
 
-`llm test` 会向配置的 OpenAI-compatible `/chat/completions` 端点发送最小请求；workflow 中的 LLM step 也会使用同一 provider。自定义兼容端点可编辑 `config.toml` 中的 `[llm.providers.openai].base_url` 和 `api_key_env`。
+`llm test` 会向配置的 OpenAI-compatible `/chat/completions` 端点发送最小请求；workflow 中的 LLM step 也会使用同一 provider。自定义兼容端点可通过 `agentend llm set --base-url ... --api-key-env ...` 配置。
 
 ## 常用 CLI
 
@@ -177,6 +177,7 @@ cp .env.example .env
 
 ```env
 OPENAI_API_KEY=
+DEEPSEEK_API_KEY=
 TELEGRAM_BOT_TOKEN=
 ```
 
@@ -192,6 +193,17 @@ bash scripts/install-linux.sh /opt/agentend
 AGENTEND_INSTALL_SPEC='.[dev]' bash scripts/install-linux.sh /opt/agentend
 ```
 
+安装脚本默认会在配置完成后启动后台服务：
+
+- `agentend-worker`：运行 `agentend serve --home /opt/agentend`，处理任务、调度和 inbox。
+- `agentend-telegram`：当 `.env` 中 `TELEGRAM_BOT_TOKEN` 非空时运行 `agentend telegram serve --home /opt/agentend`。
+
+脚本会优先安装并启动 systemd 服务；OpenWrt/procd 环境会安装 `/etc/init.d/agentend-worker` 和 `/etc/init.d/agentend-telegram`；没有 init 系统时会用 `data/logs/*.pid` 和 `data/logs/*.log` 启动兜底后台进程。只想初始化不启动服务时：
+
+```bash
+AGENTEND_START_SERVICES=0 bash scripts/install-linux.sh /opt/agentend
+```
+
 Playwright 不再是基础依赖。只有需要 browser Playwright 后端时安装：
 
 ```bash
@@ -203,16 +215,18 @@ OpenWrt / musl 环境注意事项：
 
 - `python3 -m venv` 报 `No module named venv` 时，先安装系统提供的 venv 包；如果镜像没有该包，建议换到带完整 Python 的环境或容器中部署。
 - musl + Python 3.13 通常没有可用的 Playwright wheel，所以不要在 OpenWrt 上安装 `.[browser]` 或旧的 `.[dev]` 路径。
-- OpenWrt 不使用 systemd，下面的 `deploy/agentend.service` 只适用于 systemd 发行版；OpenWrt 需要用 procd/init.d，或先手工运行 `agentend telegram serve --home /opt/agentend`。
+- OpenWrt 不使用 systemd，安装脚本会改用 procd/init.d 注册并启动 `agentend-worker` 和 `agentend-telegram`。
 
-安装 systemd service：
+手工安装 systemd service：
 
 ```bash
-sudo cp deploy/agentend.service /etc/systemd/system/agentend.service
+sudo cp deploy/agentend-worker.service /etc/systemd/system/agentend-worker.service
+sudo cp deploy/agentend.service /etc/systemd/system/agentend-telegram.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now agentend
-sudo systemctl status agentend
-sudo journalctl -u agentend -f
+sudo systemctl enable --now agentend-worker
+sudo systemctl enable --now agentend-telegram
+sudo systemctl status agentend-worker agentend-telegram
+sudo journalctl -u agentend-worker -u agentend-telegram -f
 ```
 
 数据库备份：
@@ -230,7 +244,7 @@ git pull
 . .venv/bin/activate
 python -m pip install -e .
 agentend db init --home /opt/agentend
-sudo systemctl restart agentend
+sudo systemctl restart agentend-worker agentend-telegram
 ```
 
 ## 测试

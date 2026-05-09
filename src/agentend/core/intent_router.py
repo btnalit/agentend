@@ -138,6 +138,19 @@ def decide_intent(home: Path, session: Session, text: str) -> IntentDecision:
         )
 
     lowered = normalized.lower()
+    if _looks_like_service_availability_check(normalized, lowered):
+        return _finalize_intent_decision(
+            resolved_home,
+            session,
+            IntentDecision(
+                intent_type="chat",
+                goal=normalized,
+                confidence=0.94,
+                candidate_actions=[IntentCandidateAction("workflow_run", "simple_chat", 0.9, {"input": normalized})],
+                routing_reason="short service availability check should stay in chat",
+            ),
+        )
+
     if _looks_like_prompt_injection(lowered) or _contains_any(lowered, ["删除整个", "delete everything", "rm -rf"]):
         return _finalize_intent_decision(
             resolved_home,
@@ -519,6 +532,28 @@ def _looks_like_tool_confusion(lowered: str) -> bool:
     search_like = _contains_any(lowered, ["搜索", "search", "调研", "research"])
     code_like = _contains_any(lowered, ["测试", "pytest", "code", "bug"])
     return sum([read_like, search_like, code_like]) >= 2
+
+
+def _looks_like_service_availability_check(normalized: str, lowered: str) -> bool:
+    compact = re.sub(r"\s+", "", normalized)
+    if len(compact) > 24:
+        return False
+    if _contains_any(lowered, ["pytest", "代码", "项目", "文件", "跑测试", "运行测试", "test command", "run tests"]):
+        return False
+    return _contains_any(
+        lowered,
+        [
+            "测试是否可用",
+            "测试可用",
+            "是否可用",
+            "能用吗",
+            "可用吗",
+            "能不能用",
+            "在吗",
+            "ping",
+            "hello",
+        ],
+    )
 
 
 def _estimate_tokens(text: str) -> int:
