@@ -41,7 +41,7 @@ def test_linux_deploy_artifacts_are_present() -> None:
     assert "telegram serve --home" in openwrt_telegram.read_text(encoding="utf-8")
     assert installer.exists()
     installer_text = installer.read_text(encoding="utf-8")
-    assert "agentend init --home" in installer_text
+    assert "\"$AGENTEND_BIN\" init --home \"$APP_HOME\"" in installer_text
     assert "python -m pip install -e \"$INSTALL_SPEC\"" in installer_text
     assert "python3 -m venv .venv" in installer_text
     assert "run_interactive_setup" in installer_text
@@ -56,12 +56,31 @@ def test_linux_deploy_artifacts_are_present() -> None:
     assert "systemctl enable --now" in installer_text
     assert "/etc/init.d/agentend-worker" in installer_text
     assert "AGENTEND_START_SERVICES" in installer_text
+    assert "install_target_runtime" in installer_text
+    assert "python3 -m pip install --target \"$APP_HOME/.deps\"" in installer_text
+    assert "create_agentend_wrapper" in installer_text
+    assert "install_shell_command" in installer_text
+    assert "ln -sf \"$AGENTEND_BIN\"" in installer_text
+    assert "APP_HOME/bin/agentend" in installer_text
     assert ".[dev]" not in installer_text
     assert env_example.exists()
     assert "TELEGRAM_BOT_TOKEN=" in env_example.read_text(encoding="utf-8")
     readme_text = readme.read_text(encoding="utf-8")
     assert "systemd" in readme_text
     assert "python -m pip install -e ." in readme_text
+
+
+def test_openwrt_deploy_services_use_agentend_wrapper() -> None:
+    root = Path(__file__).resolve().parents[1]
+
+    worker_service = (root / "deploy" / "agentend-worker.service").read_text(encoding="utf-8")
+    telegram_service = (root / "deploy" / "agentend.service").read_text(encoding="utf-8")
+    openwrt_worker = (root / "deploy" / "openwrt" / "agentend-worker.init").read_text(encoding="utf-8")
+    openwrt_telegram = (root / "deploy" / "openwrt" / "agentend-telegram.init").read_text(encoding="utf-8")
+
+    for text in [worker_service, telegram_service, openwrt_worker, openwrt_telegram]:
+        assert ".venv/bin/agentend" not in text
+        assert "bin/agentend" in text
 
 
 def test_runtime_install_does_not_require_playwright() -> None:

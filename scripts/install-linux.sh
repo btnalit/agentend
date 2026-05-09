@@ -6,6 +6,8 @@ REPO_URL="${AGENTEND_REPO_URL:-https://github.com/btnalit/agentend.git}"
 INSTALL_SPEC="${AGENTEND_INSTALL_SPEC:-.}"
 SETUP_MODE="${AGENTEND_SETUP:-auto}"
 START_SERVICES="${AGENTEND_START_SERVICES:-1}"
+AGENTEND_BIN="$APP_HOME/bin/agentend"
+AGENTEND_PYTHON="python3"
 
 as_root() {
   if [ "$(id -u)" -eq 0 ]; then
@@ -47,12 +49,12 @@ run_interactive_setup() {
   setup_search
   echo
   echo "Configuration summary:"
-  agentend llm current --home "$APP_HOME" || true
-  agentend secrets list --home "$APP_HOME" || true
+  "$AGENTEND_BIN" llm current --home "$APP_HOME" || true
+  "$AGENTEND_BIN" secrets list --home "$APP_HOME" || true
   echo
   echo "Running basic checks:"
-  agentend llm test --home "$APP_HOME" || echo "LLM test failed. Check provider settings or API key."
-  agentend doctor --home "$APP_HOME" || true
+  "$AGENTEND_BIN" llm test --home "$APP_HOME" || echo "LLM test failed. Check provider settings or API key."
+  "$AGENTEND_BIN" doctor --home "$APP_HOME" || true
 }
 
 setup_llm() {
@@ -66,7 +68,7 @@ setup_llm() {
   choice="${choice:-fake}"
   case "$choice" in
     1|fake|skip)
-      agentend llm set --home "$APP_HOME" --provider fake --model fake-llm
+      "$AGENTEND_BIN" llm set --home "$APP_HOME" --provider fake --model fake-llm
       ;;
     2|deepseek)
       prompt_default model "Model" "deepseek-v4-flash"
@@ -74,7 +76,7 @@ setup_llm() {
       prompt_default api_key_env "API key env name" "DEEPSEEK_API_KEY"
       prompt_secret secret "Paste $api_key_env, or press Enter to skip"
       set_env_value "$api_key_env" "$secret"
-      agentend llm set --home "$APP_HOME" --provider deepseek --model "$model" --base-url "$base_url" --api-key-env "$api_key_env"
+      "$AGENTEND_BIN" llm set --home "$APP_HOME" --provider deepseek --model "$model" --base-url "$base_url" --api-key-env "$api_key_env"
       ;;
     3|openai)
       prompt_default model "Model" "gpt-4.1"
@@ -82,7 +84,7 @@ setup_llm() {
       prompt_default api_key_env "API key env name" "OPENAI_API_KEY"
       prompt_secret secret "Paste $api_key_env, or press Enter to skip"
       set_env_value "$api_key_env" "$secret"
-      agentend llm set --home "$APP_HOME" --provider openai --model "$model" --base-url "$base_url" --api-key-env "$api_key_env"
+      "$AGENTEND_BIN" llm set --home "$APP_HOME" --provider openai --model "$model" --base-url "$base_url" --api-key-env "$api_key_env"
       ;;
     4|custom)
       prompt_required provider "Provider name"
@@ -92,11 +94,11 @@ setup_llm() {
       prompt_default api_key_env "API key env name" "$default_env"
       prompt_secret secret "Paste $api_key_env, or press Enter to skip"
       set_env_value "$api_key_env" "$secret"
-      agentend llm set --home "$APP_HOME" --provider "$provider" --model "$model" --base-url "$base_url" --api-key-env "$api_key_env"
+      "$AGENTEND_BIN" llm set --home "$APP_HOME" --provider "$provider" --model "$model" --base-url "$base_url" --api-key-env "$api_key_env"
       ;;
     *)
       echo "Unknown choice. Keeping fake provider."
-      agentend llm set --home "$APP_HOME" --provider fake --model fake-llm
+      "$AGENTEND_BIN" llm set --home "$APP_HOME" --provider fake --model fake-llm
       ;;
   esac
 }
@@ -159,7 +161,7 @@ set_env_value() {
   value="$2"
   [ -n "$key" ] || return 0
   [ -n "$value" ] || return 0
-  "$APP_HOME/.venv/bin/python" - "$APP_HOME/.env" "$key" "$value" <<'PY'
+  "$AGENTEND_PYTHON" - "$APP_HOME/.env" "$key" "$value" <<'PY'
 from pathlib import Path
 import sys
 
@@ -215,6 +217,106 @@ write_root_file() {
   rm -f "$tmp"
 }
 
+ensure_python_base_modules() {
+  if python3 - <<'PY' >/dev/null 2>&1
+import sqlite3
+import ssl
+PY
+  then
+    return
+  fi
+  cat >&2 <<'EOF'
+Python is missing required standard-library modules.
+
+On OpenWrt, install the split Python packages, then re-run:
+  opkg update
+  opkg install python3-pip python3-sqlite3 python3-ssl ca-bundle
+EOF
+  exit 1
+}
+
+install_python_runtime() {
+  ensure_python_base_modules
+  if python3 -m venv .venv; then
+    install_venv_runtime
+  else
+    install_target_runtime
+  fi
+  create_agentend_wrapper
+  install_shell_command
+}
+
+install_venv_runtime() {
+  . .venv/bin/activate
+  python -m pip install --upgrade pip
+  python -m pip install -e "$INSTALL_SPEC"
+  AGENTEND_PYTHON="$APP_HOME/.venv/bin/python"
+}
+
+install_target_runtime() {
+  echo "Python venv is not available; using local target runtime under $APP_HOME/.deps."
+  if ! python3 -m pip --version >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+Python pip is not available.
+
+On OpenWrt, install pip, then re-run:
+  opkg update
+  opkg install python3-pip
+EOF
+    exit 1
+  fi
+  if [ "$INSTALL_SPEC" != "." ]; then
+    echo "AGENTEND_INSTALL_SPEC=$INSTALL_SPEC is ignored without venv; installing the runtime dependency set only."
+  fi
+  mkdir -p "$APP_HOME/.deps"
+  python3 -m pip install --target "$APP_HOME/.deps" --upgrade \
+    "httpx>=0.27" \
+    "pydantic>=2" \
+    "PyYAML>=6" \
+    "SQLAlchemy>=2" \
+    "typer>=0.12" \
+    "python-telegram-bot>=21" \
+    "mcp>=1.0" \
+    "starlette>=0.40,<0.48"
+  AGENTEND_PYTHON="python3"
+}
+
+create_agentend_wrapper() {
+  mkdir -p "$APP_HOME/bin"
+  cat > "$AGENTEND_BIN" <<EOF
+#!/usr/bin/env sh
+APP_HOME="$APP_HOME"
+if [ -x "\$APP_HOME/.venv/bin/agentend" ]; then
+  exec "\$APP_HOME/.venv/bin/agentend" "\$@"
+fi
+export PYTHONPATH="\$APP_HOME/src:\$APP_HOME/.deps\${PYTHONPATH:+:\$PYTHONPATH}"
+exec python3 -c 'from agentend.cli import main; main()' "\$@"
+EOF
+  chmod +x "$AGENTEND_BIN"
+}
+
+install_shell_command() {
+  target_dir=""
+  if [ -d /usr/local/bin ]; then
+    target_dir="/usr/local/bin"
+  elif [ -d /usr/bin ]; then
+    target_dir="/usr/bin"
+  fi
+  if [ -z "$target_dir" ]; then
+    echo "No system PATH directory found; use $AGENTEND_BIN directly."
+    return
+  fi
+  if [ -w "$target_dir" ]; then
+    ln -sf "$AGENTEND_BIN" "$target_dir/agentend"
+    return
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo ln -sf "$AGENTEND_BIN" "$target_dir/agentend" || echo "Could not install agentend command; use $AGENTEND_BIN directly."
+    return
+  fi
+  echo "Could not install agentend command in $target_dir; use $AGENTEND_BIN directly."
+}
+
 install_background_services() {
   if ! should_start_services; then
     echo "Background service startup skipped by AGENTEND_START_SERVICES=$START_SERVICES."
@@ -241,7 +343,7 @@ After=network.target
 [Service]
 WorkingDirectory=$APP_HOME
 EnvironmentFile=-$APP_HOME/.env
-ExecStart=$APP_HOME/.venv/bin/agentend serve --home $APP_HOME
+ExecStart=$AGENTEND_BIN serve --home $APP_HOME
 Restart=always
 RestartSec=5
 
@@ -257,7 +359,7 @@ After=network.target
 [Service]
 WorkingDirectory=$APP_HOME
 EnvironmentFile=-$APP_HOME/.env
-ExecStart=$APP_HOME/.venv/bin/agentend telegram serve --home $APP_HOME
+ExecStart=$AGENTEND_BIN telegram serve --home $APP_HOME
 Restart=always
 RestartSec=5
 
@@ -291,7 +393,7 @@ APP_HOME="$APP_HOME"
 
 start_service() {
   procd_open_instance
-  procd_set_param command "\$APP_HOME/.venv/bin/agentend" serve --home "\$APP_HOME"
+  procd_set_param command "\$APP_HOME/bin/agentend" serve --home "\$APP_HOME"
   procd_set_param dir "\$APP_HOME"
   procd_set_param respawn 3600 5 5
   procd_close_instance
@@ -309,7 +411,7 @@ APP_HOME="$APP_HOME"
 
 start_service() {
   procd_open_instance
-  procd_set_param command "\$APP_HOME/.venv/bin/agentend" telegram serve --home "\$APP_HOME"
+  procd_set_param command "\$APP_HOME/bin/agentend" telegram serve --home "\$APP_HOME"
   procd_set_param dir "\$APP_HOME"
   procd_set_param respawn 3600 5 5
   procd_close_instance
@@ -329,9 +431,9 @@ EOF
 start_fallback_background_services() {
   echo "No systemd or OpenWrt procd detected; starting fallback background processes."
   mkdir -p "$APP_HOME/data/logs"
-  start_fallback_service "agentend-worker" "$APP_HOME/.venv/bin/agentend" serve --home "$APP_HOME"
+  start_fallback_service "agentend-worker" "$AGENTEND_BIN" serve --home "$APP_HOME"
   if telegram_configured; then
-    start_fallback_service "agentend-telegram" "$APP_HOME/.venv/bin/agentend" telegram serve --home "$APP_HOME"
+    start_fallback_service "agentend-telegram" "$AGENTEND_BIN" telegram serve --home "$APP_HOME"
   else
     echo "TELEGRAM_BOT_TOKEN is empty; Telegram background process not started."
   fi
@@ -362,24 +464,8 @@ main() {
   fi
 
   cd "$APP_HOME"
-  if ! python3 -m venv .venv; then
-    cat >&2 <<'EOF'
-Python venv is not available in this interpreter.
-
-Install the distro package that provides venv, then re-run this script.
-Examples:
-  Debian/Ubuntu: apt install python3-venv
-  OpenWrt: opkg update && opkg list | grep -E '^python3.*venv'
-
-AgentEnd's default Linux installer requires a venv so the system Python
-environment is not modified.
-EOF
-    exit 1
-  fi
-  . .venv/bin/activate
-  python -m pip install --upgrade pip
-  python -m pip install -e "$INSTALL_SPEC"
-  agentend init --home "$APP_HOME"
+  install_python_runtime
+  "$AGENTEND_BIN" init --home "$APP_HOME"
   ensure_env_file
 
   if should_run_setup; then
@@ -391,7 +477,7 @@ EOF
 
   echo
   echo "AgentEnd initialized at $APP_HOME."
-  echo "Run checks with: $APP_HOME/.venv/bin/agentend doctor --home $APP_HOME"
+  echo "Run checks with: $AGENTEND_BIN doctor --home $APP_HOME"
   if command -v systemctl >/dev/null 2>&1; then
     echo "Systemd services: agentend-worker.service and agentend-telegram.service"
   else

@@ -204,6 +204,8 @@ AGENTEND_INSTALL_SPEC='.[dev]' bash scripts/install-linux.sh /opt/agentend
 AGENTEND_START_SERVICES=0 bash scripts/install-linux.sh /opt/agentend
 ```
 
+脚本会创建 `/opt/agentend/bin/agentend`，并尽量链接到系统 PATH 中的 `agentend` 命令；如果系统目录不可写，可直接使用 `/opt/agentend/bin/agentend`。
+
 Playwright 不再是基础依赖。只有需要 browser Playwright 后端时安装：
 
 ```bash
@@ -213,7 +215,8 @@ python -m playwright install chromium
 
 OpenWrt / musl 环境注意事项：
 
-- `python3 -m venv` 报 `No module named venv` 时，先安装系统提供的 venv 包；如果镜像没有该包，建议换到带完整 Python 的环境或容器中部署。
+- `python3 -m venv` 报 `No module named venv` 时，安装脚本会自动退回到 OpenWrt 兼容模式：依赖安装到 `/opt/agentend/.deps`，命令入口写到 `/opt/agentend/bin/agentend`。
+- OpenWrt 建议先安装基础包：`opkg update && opkg install git bash python3 python3-pip python3-sqlite3 python3-ssl ca-bundle`。
 - musl + Python 3.13 通常没有可用的 Playwright wheel，所以不要在 OpenWrt 上安装 `.[browser]` 或旧的 `.[dev]` 路径。
 - OpenWrt 不使用 systemd，安装脚本会改用 procd/init.d 注册并启动 `agentend-worker` 和 `agentend-telegram`。
 
@@ -241,9 +244,7 @@ agentend db backup --home /opt/agentend --output /opt/agentend/backups/agentend.
 ```bash
 cd /opt/agentend
 git pull
-. .venv/bin/activate
-python -m pip install -e .
-agentend db init --home /opt/agentend
+bash scripts/install-linux.sh /opt/agentend
 sudo systemctl restart agentend-worker agentend-telegram
 ```
 
