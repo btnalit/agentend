@@ -117,6 +117,7 @@ class ToolRegistry:
                     tool_name=name,
                     side_effect=side_effect,
                     run_mode=context.run_mode,
+                    input_data=input_data,
                 )
             cached = get_cached_result(context.session, context, name, input_data, side_effect=side_effect)
             result = rehydrate_cached_evidence(context.session, context, name, cached) if cached is not None else self.get(name).call(input_data, context)

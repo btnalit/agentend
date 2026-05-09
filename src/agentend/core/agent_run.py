@@ -21,6 +21,7 @@ from agentend.core.intent_audit import record_intent_decision
 from agentend.core.memory_consolidator import consolidate_memory_candidates
 from agentend.core.memory_store import search_memory_items
 from agentend.core.skills import ensure_builtin_skills
+from agentend.core.tool_contracts import BUILTIN_SIDE_EFFECTS, idempotency_metadata, manifest_to_dict
 from agentend.core.tool_registry import ToolRegistry
 from agentend.core.workflow_registry import WorkflowRegistry
 from agentend.core.workflow_runner import WorkflowRunFailed, WorkflowRunner
@@ -36,6 +37,8 @@ from agentend.db.models import (
     RunStep,
     Skill,
     ToolCall,
+    ToolContractSnapshot,
+    ToolManifest,
     MemoryUseEvent,
     utc_now,
 )
@@ -126,6 +129,12 @@ class AgentRunController:
             if agent_run.status == "cancelled":
                 raise ValueError(f"Cannot resume cancelled agent run: {agent_run_id}")
             previous_observations = _previous_observations_from_iterations(iterations)
+            if agent_run.status == "waiting_input" and agent_run.stop_reason == "resume_manual_review_required":
+                return _result_from_agent_run(agent_run)
+            reviewed_tool_call_ids = _reviewed_resume_tool_call_ids(agent_run)
+            resume_issue = self._running_non_idempotent_tool_call(session, iterations, reviewed_tool_call_ids)
+            if resume_issue is not None:
+                return self._record_resume_manual_review(session, agent_run, resume_issue)
             start_iteration_index = (iterations[-1].iteration_index + 1) if iterations else 1
             max_iteration_index = start_iteration_index + additional_iterations - 1
             agent_run.status = "running"
@@ -147,6 +156,128 @@ class AgentRunController:
             start_iteration_index=start_iteration_index,
             max_iteration_index=max_iteration_index,
             previous_observations=previous_observations,
+        )
+
+    def _running_non_idempotent_tool_call(
+        self,
+        session,
+        iterations: list[AgentIteration],
+        reviewed_tool_call_ids: set[str],
+    ) -> dict[str, Any] | None:
+        linked_run_ids = sorted({iteration.linked_run_id for iteration in iterations if iteration.linked_run_id})
+        if not linked_run_ids:
+            return None
+        tool_calls = (
+            session.execute(
+                select(ToolCall)
+                .where(ToolCall.run_id.in_(linked_run_ids))
+                .where(ToolCall.status.in_(["running", "executing"]))
+                .order_by(ToolCall.created_at.desc())
+            )
+            .scalars()
+            .all()
+        )
+        for tool_call in tool_calls:
+            if tool_call.id in reviewed_tool_call_ids:
+                continue
+            contract = _tool_contract_payload_for_call(session, tool_call)
+            if contract.get("idempotent") is False:
+                return {
+                    "tool_call_id": tool_call.id,
+                    "run_id": tool_call.run_id,
+                    "step_id": tool_call.step_id,
+                    "tool_name": tool_call.tool_name,
+                    "tool_status": tool_call.status,
+                    "input_json": tool_call.input_json,
+                    "side_effect": str(contract.get("side_effect") or "unknown"),
+                    "idempotency": "non_idempotent",
+                    "preview_supported": bool(contract.get("preview_supported", False)),
+                    "dry_run_supported": bool(contract.get("dry_run_supported", False)),
+                    "compensation_supported": bool(contract.get("compensation_supported", False)),
+                    "compensation_hint": str(contract.get("compensation_hint") or ""),
+                }
+        return None
+
+    def _record_resume_manual_review(
+        self,
+        session,
+        agent_run: AgentRun,
+        issue: dict[str, Any],
+    ) -> AgentRunResult:
+        conversation_id = agent_run.conversation_id
+        if conversation_id is None:
+            conversation = Conversation(
+                id=str(uuid4()),
+                channel=agent_run.channel,
+                external_user_id=agent_run.external_user_id,
+                title=agent_run.goal[:80],
+            )
+            session.add(conversation)
+            conversation_id = conversation.id
+            agent_run.conversation_id = conversation_id
+        tool_name = str(issue["tool_name"])
+        question = (
+            f"Resume paused: tool call {tool_name} is still {issue['tool_status']} "
+            "and is non-idempotent. Inspect the side effects before continuing."
+        )
+        reason = (
+            f"running non-idempotent tool call requires manual review before resume: "
+            f"{tool_name} ({issue['side_effect']})"
+        )
+        run = Run(
+            id=str(uuid4()),
+            conversation_id=conversation_id,
+            workflow_id="agent.resume_manual_review",
+            status="waiting_input",
+            input_json=json.dumps({"agent_run_id": agent_run.id, "resume_issue": issue}, ensure_ascii=False, sort_keys=True),
+            result_json="{}",
+            error=reason,
+        )
+        step = RunStep(
+            id=str(uuid4()),
+            run_id=run.id,
+            node_id="resume.manual_review",
+            status="waiting_input",
+            input_json=json.dumps(issue, ensure_ascii=False, sort_keys=True),
+            output_json=json.dumps({"content": question}, ensure_ascii=False, sort_keys=True),
+            error=reason,
+        )
+        session.add(run)
+        session.add(step)
+        request = create_clarification_request(
+            session,
+            run_id=run.id,
+            step_id=step.id,
+            request_type="resume_manual_review",
+            question=question,
+            reason=reason,
+            choices=["reviewed_continue", "cancel"],
+            free_text_allowed=True,
+        )
+        payload = {
+            "content": question,
+            "linked_run_id": run.id,
+            "resume_issue": issue,
+            "clarification_request_id": request.id,
+        }
+        run.result_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        agent_run.status = "waiting_input"
+        agent_run.stop_reason = "resume_manual_review_required"
+        agent_run.completed_at = None
+        agent_run.heartbeat_at = utc_now()
+        agent_run.final_result_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        record_event(
+            session,
+            "resume.manual_review_required",
+            {"agent_run_id": agent_run.id, **issue},
+            run_id=run.id,
+        )
+        return AgentRunResult(
+            agent_run_id=agent_run.id,
+            status="waiting_input",
+            stop_reason="resume_manual_review_required",
+            content=question,
+            linked_run_id=run.id,
         )
 
     def _run_loop(
@@ -987,6 +1118,42 @@ def _capability_type(action_type: str) -> str:
     if action_type == "tool_call":
         return "tool"
     return "agent"
+
+
+def _tool_contract_payload_for_call(session, tool_call: ToolCall) -> dict[str, Any]:
+    snapshot = (
+        session.execute(
+            select(ToolContractSnapshot)
+            .where(ToolContractSnapshot.run_id == tool_call.run_id)
+            .where(ToolContractSnapshot.tool_name == tool_call.tool_name)
+            .order_by(ToolContractSnapshot.created_at.desc())
+        )
+        .scalars()
+        .first()
+    )
+    if snapshot is not None:
+        return _json_dict(snapshot.contract_json)
+    manifest = session.get(ToolManifest, tool_call.tool_name)
+    if manifest is not None:
+        return manifest_to_dict(manifest)
+    side_effect = BUILTIN_SIDE_EFFECTS.get(tool_call.tool_name, "unknown")
+    return {
+        "name": tool_call.tool_name,
+        "side_effect": side_effect,
+        **idempotency_metadata(tool_call.tool_name, side_effect),
+    }
+
+
+def _reviewed_resume_tool_call_ids(agent_run: AgentRun) -> set[str]:
+    payload = _json_dict(agent_run.final_result_json)
+    review = payload.get("resume_manual_review")
+    if not isinstance(review, dict) or review.get("decision") != "reviewed_continue":
+        return set()
+    issue = review.get("resume_issue")
+    if not isinstance(issue, dict):
+        return set()
+    tool_call_id = issue.get("tool_call_id")
+    return {str(tool_call_id)} if tool_call_id else set()
 
 
 def _latest_checkpoint_id(session, run_id: str | None) -> str | None:

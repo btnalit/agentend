@@ -1629,6 +1629,7 @@ def capabilities_refresh(
     init_database(resolved_home)
     registry = ToolRegistry(resolved_home)
     with session_scope(resolved_home) as session:
+        ensure_builtin_skills(resolved_home, session)
         sync_tool_manifests(session, registry.manifests())
         rows = refresh_capabilities(session)
         typer.echo(f"Capabilities refreshed: {len(rows)}")
@@ -1655,6 +1656,7 @@ def capabilities_query(
     init_database(resolved_home)
     with session_scope(resolved_home) as session:
         if not session.execute(select(Capability)).first():
+            ensure_builtin_skills(resolved_home, session)
             sync_tool_manifests(session, ToolRegistry(resolved_home).manifests())
             refresh_capabilities(session)
         for row in query_capabilities(session, query):

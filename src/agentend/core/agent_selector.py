@@ -66,6 +66,7 @@ def select_next_action_with_trace(
     intent_slots = dict(intent.get("slots", {})) if isinstance(intent.get("slots"), dict) else {}
     allowed_tools = {str(item) for item in intent.get("allowed_tools", []) if item}
     allowed_tools_explicit = "allowed_tools" in intent
+    allowed_capabilities, allowed_capabilities_explicit = _allowed_capability_policy(analysis)
     previous = previous_observations or []
     failed_names = {
         str(observation.get("action_name"))
@@ -76,6 +77,7 @@ def select_next_action_with_trace(
     needs_command_probe = _needs_test_command_probe(goal, goal_type, previous)
     requirements = _requirements_from_analysis(analysis)
     missing_requirements = _missing_requirements(previous)
+    required_probe_tool = _probe_tool_for_missing(missing_requirements)
     candidates: list[dict[str, Any]] = []
 
     skill_candidates = _ordered_skill_candidates(session, goal, analysis)
@@ -95,8 +97,15 @@ def select_next_action_with_trace(
             missing_requirements,
             contract,
         )
+        if allowed_capabilities_explicit and skill.id not in allowed_capabilities:
+            if "capability not allowed by allowed_capabilities" not in rejected_reasons:
+                rejected_reasons.append("capability not allowed by allowed_capabilities")
+            breakdown = dict(breakdown)
+            score = -1.0
+        else:
+            score = sum(breakdown.values())
         candidates.append(
-            _candidate_trace("skill_run", skill.id, breakdown, sum(breakdown.values()), rejected_reasons, {"task": goal, "goal": goal}, contract)
+            _candidate_trace("skill_run", skill.id, breakdown, score, rejected_reasons, {"task": goal, "goal": goal}, contract)
         )
 
     tool_candidates = _ordered_tool_candidates(session, goal, analysis)
@@ -121,9 +130,13 @@ def select_next_action_with_trace(
                 contract,
             )
             score = sum(breakdown.values())
-        if allowed_tools_explicit and tool.name not in allowed_tools:
+        if allowed_tools_explicit and tool.name not in allowed_tools and tool.name != required_probe_tool:
             if "tool not allowed by intent allowed_tools" not in rejected_reasons:
                 rejected_reasons.append("tool not allowed by intent allowed_tools")
+            score = -1.0
+        if allowed_capabilities_explicit and tool.name not in allowed_capabilities and tool.name != required_probe_tool:
+            if "capability not allowed by allowed_capabilities" not in rejected_reasons:
+                rejected_reasons.append("capability not allowed by allowed_capabilities")
             score = -1.0
         candidates.append(_candidate_trace("tool_call", tool.name, breakdown, score, rejected_reasons, input_data, contract))
 
@@ -167,7 +180,11 @@ def select_next_action_with_trace(
     trace_candidates = candidates[:8]
     trace_keys = {(item["type"], item["name"]) for item in trace_candidates}
     for item in candidates[8:]:
-        if "tool not allowed by intent allowed_tools" not in item.get("rejected_reasons", []):
+        rejected = item.get("rejected_reasons", [])
+        if (
+            "tool not allowed by intent allowed_tools" not in rejected
+            and "capability not allowed by allowed_capabilities" not in rejected
+        ):
             continue
         trace_key = (item["type"], item["name"])
         if trace_key in trace_keys:
@@ -197,7 +214,8 @@ def _ordered_skill_candidates(session: Session, goal: str, analysis: dict[str, A
         for item in intent.get("candidate_actions", [])
         if isinstance(item, dict) and item.get("type") == "skill_run" and item.get("name")
     ]
-    candidate_ids = [*intent_candidates, *[str(item) for item in analysis.get("candidate_skills", []) if item]]
+    capability_candidates = _capability_candidate_ids(analysis, "skill")
+    candidate_ids = [*intent_candidates, *capability_candidates, *[str(item) for item in analysis.get("candidate_skills", []) if item]]
     rows = {row.id: row for row in session.execute(select(Skill).order_by(Skill.id)).scalars().all()}
     ordered: list[Skill] = [rows[item] for item in candidate_ids if item in rows]
     lowered = goal.lower()
@@ -223,7 +241,8 @@ def _ordered_tool_candidates(session: Session, goal: str, analysis: dict[str, An
         for item in intent.get("candidate_actions", [])
         if isinstance(item, dict) and item.get("type") == "tool_call" and item.get("name")
     ]
-    candidate_ids = [*intent_candidates, *[str(item) for item in analysis.get("candidate_tools", []) if item]]
+    capability_candidates = _capability_candidate_ids(analysis, "tool")
+    candidate_ids = [*intent_candidates, *capability_candidates, *[str(item) for item in analysis.get("candidate_tools", []) if item]]
     rows = {row.name: row for row in session.execute(select(ToolManifest).order_by(ToolManifest.name)).scalars().all()}
     ordered: list[ToolManifest] = [rows[item] for item in candidate_ids if item in rows]
     lowered = goal.lower()
@@ -470,6 +489,33 @@ def _intent_decision(analysis: dict[str, Any]) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _allowed_capability_policy(analysis: dict[str, Any]) -> tuple[set[str], bool]:
+    if "allowed_capabilities" not in analysis:
+        return set(), False
+    raw_values = analysis.get("allowed_capabilities", [])
+    if not isinstance(raw_values, list):
+        return set(), True
+    return {str(item) for item in raw_values if item}, True
+
+
+def _capability_candidate_ids(analysis: dict[str, Any], capability_type: str) -> list[str]:
+    rows = analysis.get("candidate_capabilities", [])
+    if not isinstance(rows, list):
+        return []
+    result: list[str] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != capability_type:
+            continue
+        if item.get("executable") is False:
+            continue
+        capability_id = item.get("id") or item.get("capability_id") or item.get("name")
+        if capability_id is not None and str(capability_id) not in result:
+            result.append(str(capability_id))
+    return result
+
+
 def _intent_candidate_score(analysis: dict[str, Any], action_type: str, name: str) -> float:
     intent = _intent_decision(analysis)
     for item in intent.get("candidate_actions", []):
@@ -522,6 +568,12 @@ def _missing_requirements(previous_observations: list[dict[str, Any]]) -> set[st
     return missing
 
 
+def _probe_tool_for_missing(missing_requirements: set[str]) -> str | None:
+    if "test_command_evidence" in missing_requirements:
+        return "shell.run"
+    return None
+
+
 def _apply_requirement_match(
     breakdown: dict[str, float],
     requirements: list[str],
@@ -531,7 +583,8 @@ def _apply_requirement_match(
     if not missing_requirements:
         return
     evidence = set(contract.get("evidence_produced", []))
-    matches = set(requirements).intersection(missing_requirements).intersection(evidence)
+    expected_requirements = set(requirements) if requirements else set(missing_requirements)
+    matches = expected_requirements.intersection(missing_requirements).intersection(evidence)
     if matches:
         breakdown["requirement_match"] = float(len(matches) * 2.5)
 

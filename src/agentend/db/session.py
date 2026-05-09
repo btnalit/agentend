@@ -124,6 +124,18 @@ def _ensure_incremental_columns(engine: Engine) -> None:
             "deleted_count": "INTEGER NOT NULL DEFAULT 0",
             "error": "TEXT",
         },
+        "context_pack_items": {
+            "source_type": "VARCHAR(64) NOT NULL DEFAULT 'generated'",
+            "trust_level": "VARCHAR(64) NOT NULL DEFAULT 'generated'",
+            "allowed_use_json": "TEXT NOT NULL DEFAULT '[]'",
+            "can_override_policy": "VARCHAR(8) NOT NULL DEFAULT 'false'",
+        },
+        "context_dropped_items": {
+            "source_type": "VARCHAR(64) NOT NULL DEFAULT 'generated'",
+            "trust_level": "VARCHAR(64) NOT NULL DEFAULT 'generated'",
+            "allowed_use_json": "TEXT NOT NULL DEFAULT '[]'",
+            "can_override_policy": "VARCHAR(8) NOT NULL DEFAULT 'false'",
+        },
     }
     with engine.begin() as connection:
         for table, columns in additions.items():

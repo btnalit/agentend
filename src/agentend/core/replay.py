@@ -175,15 +175,27 @@ def _plan_tool_step(
 
     side_effect = str(source_contract.get("side_effect") or current_contract.get("side_effect") or "none")
     side_effect = effective_side_effect(tool_call.tool_name, _json_or_empty(tool_call.input_json), side_effect)
+    idempotent = bool(source_contract.get("idempotent", current_contract.get("idempotent", side_effect not in BLOCKED_REPLAY_SIDE_EFFECTS)))
+    idempotency = "idempotent" if idempotent else "non_idempotent"
+    replay_metadata = {
+        "side_effect": side_effect,
+        "idempotency": idempotency,
+        "idempotency_key_supported": bool(source_contract.get("idempotency_key_supported", current_contract.get("idempotency_key_supported", False))),
+        "preview_supported": bool(source_contract.get("preview_supported", current_contract.get("preview_supported", False))),
+        "dry_run_supported": bool(source_contract.get("dry_run_supported", current_contract.get("dry_run_supported", False))),
+        "compensation_supported": bool(source_contract.get("compensation_supported", current_contract.get("compensation_supported", False))),
+        "compensation_hint": str(source_contract.get("compensation_hint") or current_contract.get("compensation_hint") or ""),
+        "contract_drift": False,
+        "contract_diff": [],
+    }
     if side_effect in BLOCKED_REPLAY_SIDE_EFFECTS:
         return base | {
             "strategy": "block",
-            "skip_reason": f"{side_effect} is blocked during replay",
-            "side_effect": side_effect,
-            "contract_drift": False,
-            "contract_diff": [],
+            "skip_reason": f"{side_effect} is blocked during replay because it is non-idempotent",
+            "replay_action": "manual_review_required",
+            **replay_metadata,
         }
-    return base | {"side_effect": side_effect, "contract_drift": False, "contract_diff": []}
+    return base | {"replay_action": "reuse_recorded_output", **replay_metadata}
 
 
 def _step_plan(
@@ -258,6 +270,7 @@ def _record_blocked_replay_decisions(session: Session, *, run_id: str, plan: dic
                 tool_name=tool_name,
                 side_effect=side_effect,
                 run_mode="replay",
+                idempotency=str(step.get("idempotency") or "") or None,
             )
         except PermissionError:
             continue

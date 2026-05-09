@@ -359,6 +359,10 @@ class ContextPackItem(Base):
     summary: Mapped[str] = mapped_column(Text, nullable=False)
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     token_estimate: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    source_type: Mapped[str] = mapped_column(String(64), default="generated", nullable=False, index=True)
+    trust_level: Mapped[str] = mapped_column(String(64), default="generated", nullable=False, index=True)
+    allowed_use_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    can_override_policy: Mapped[str] = mapped_column(String(8), default="false", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
@@ -373,6 +377,10 @@ class ContextDroppedItem(Base):
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     token_estimate: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     reason: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    source_type: Mapped[str] = mapped_column(String(64), default="generated", nullable=False, index=True)
+    trust_level: Mapped[str] = mapped_column(String(64), default="generated", nullable=False, index=True)
+    allowed_use_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    can_override_policy: Mapped[str] = mapped_column(String(8), default="false", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 

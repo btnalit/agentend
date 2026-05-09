@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from agentend.config import load_config
-from agentend.core.capabilities import query_capabilities, refresh_capabilities
+from agentend.core.capabilities import capability_manifest, query_executable_capabilities, refresh_capabilities
 from agentend.core.events import record_event
 from agentend.core.agent_evaluator import infer_goal_requirements
 from agentend.core.intent_router import decide_intent
@@ -25,7 +25,7 @@ def analyze_goal(home: Path, session: Session, text: str) -> dict[str, Any]:
         workspace_rows = index_workspace(home, session)
     workflows, _ = WorkflowRegistry(load_config(home)).list_workflows()
     intent_decision = decide_intent(home, session, normalized)
-    capability_rows = query_capabilities(session, normalized)
+    capability_rows = query_executable_capabilities(session, normalized)
 
     candidate_skills: list[str] = []
     candidate_tools: list[str] = []
@@ -73,6 +73,8 @@ def analyze_goal(home: Path, session: Session, text: str) -> dict[str, Any]:
         "requirements": [requirement.to_dict() for requirement in infer_goal_requirements(normalized, {})],
         "candidate_skills": candidate_skills,
         "candidate_tools": candidate_tools,
+        "candidate_capabilities": [capability_manifest(row) for row in capability_rows[:8]],
+        "allowed_capabilities": _allowed_capabilities_from_intent(intent_decision),
         "candidate_workflows": candidate_workflows,
         "missing_inputs": intent_decision.missing_inputs or (["goal"] if not normalized else []),
         "risk_notes": sorted(set(risk_notes)),
@@ -96,3 +98,13 @@ def _contains_any(text: str, needles: list[str]) -> bool:
 def _append(values: list[str], item: str) -> None:
     if item not in values:
         values.append(item)
+
+
+def _allowed_capabilities_from_intent(intent_decision: Any) -> list[str]:
+    allowed: list[str] = []
+    for action in intent_decision.candidate_actions:
+        if action.type in {"skill_run", "workflow_run"}:
+            _append(allowed, action.name)
+    for tool_name in intent_decision.allowed_tools:
+        _append(allowed, tool_name)
+    return allowed

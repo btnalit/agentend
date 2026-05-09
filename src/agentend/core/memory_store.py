@@ -11,13 +11,15 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from agentend.core.events import record_event
+from agentend.core.memory_gate import (
+    LONG_TERM_SCOPES,
+    TRUSTED_SOURCES,
+    UNTRUSTED_ALLOWED_SCOPES,
+    decide_memory_read,
+    decide_memory_write,
+)
 from agentend.core.secrets import redact_text
 from agentend.db.models import MemoryItem, MemoryRetrieval, utc_now
-
-
-LONG_TERM_SCOPES = {"project", "user"}
-TRUSTED_SOURCES = {"manual", "agent_consolidator"}
-UNTRUSTED_ALLOWED_SCOPES = {"session", "task", "episode"}
 
 
 def write_memory_item(
@@ -31,7 +33,10 @@ def write_memory_item(
     ttl: str | None = None,
     tags: list[str] | None = None,
 ) -> MemoryItem:
-    _check_memory_write_policy(scope=scope, source=source)
+    gate = decide_memory_write(scope=scope, source=source, confidence=confidence)
+    if gate.decision == "reject":
+        record_event(session, "memory.write_gate_decided", gate.to_payload())
+        raise PermissionError(_memory_write_error(gate.reason_code, scope=scope, source=source))
     memory = MemoryItem(
         id=str(uuid4()),
         scope=scope,
@@ -44,6 +49,7 @@ def write_memory_item(
     )
     session.add(memory)
     sync_memory_fts(session, memory)
+    record_event(session, "memory.write_gate_decided", {**gate.to_payload(), "memory_id": memory.id})
     record_event(session, "memory.created", {"memory_id": memory.id, "scope": scope, "source": source})
     return memory
 
@@ -95,24 +101,8 @@ def memory_context_drop_reason(
     min_confidence: float,
     trusted_sources: set[str],
 ) -> str | None:
-    if memory.status != "active":
-        return "memory_inactive"
-    if scope and memory.scope != scope:
-        return "memory_scope_not_allowed"
-    if memory.ttl:
-        try:
-            expires_at = datetime.fromisoformat(memory.ttl)
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
-            if expires_at <= datetime.now(timezone.utc):
-                return "memory_expired"
-        except ValueError:
-            pass
-    if trusted_sources and memory.source not in trusted_sources:
-        return "memory_untrusted_source"
-    if _confidence(memory) < min_confidence:
-        return "memory_low_confidence"
-    return None
+    gate = decide_memory_read(memory, scope=scope, min_confidence=min_confidence, trusted_sources=trusted_sources)
+    return gate.reason_code if gate.decision == "drop" else None
 
 
 def sync_memory_fts(session: Session, memory: MemoryItem) -> None:
@@ -142,11 +132,12 @@ def remove_memory_fts(session: Session, memory_id: str) -> None:
         return
 
 
-def _check_memory_write_policy(*, scope: str, source: str) -> None:
-    if scope in LONG_TERM_SCOPES and source not in TRUSTED_SOURCES:
-        raise PermissionError(f"untrusted source '{source}' cannot write {scope} memory")
-    if source not in TRUSTED_SOURCES and scope not in UNTRUSTED_ALLOWED_SCOPES:
-        raise PermissionError(f"untrusted source '{source}' can only write session/task/episode memory")
+def _memory_write_error(reason_code: str, *, scope: str, source: str) -> str:
+    if reason_code == "memory_write_untrusted_long_term":
+        return f"untrusted source '{source}' cannot write {scope} memory"
+    if reason_code == "memory_write_untrusted_scope":
+        return f"untrusted source '{source}' can only write session/task/episode memory"
+    return f"memory write rejected by policy: {reason_code}"
 
 
 def _ensure_memory_fts(session: Session) -> bool:

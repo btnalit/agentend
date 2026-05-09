@@ -182,6 +182,13 @@ class WorkflowRunner:
                     resume_error = ValueError("Provide --answer for an intent clarification")
                 else:
                     result = self._resume_intent_clarification(session, run, answer)
+            elif run.workflow_id == "agent.resume_manual_review":
+                if checkpoint_id is not None:
+                    resume_error = ValueError("Agent resume manual review runs can only resume with an answer")
+                elif answer is None:
+                    resume_error = ValueError("Provide --answer for an agent resume manual review")
+                else:
+                    result = self._resume_agent_manual_review(session, run, answer)
             if result is None and resume_error is None:
                 if run.workflow_id is None:
                     raise ValueError("Run has no workflow_id and cannot be resumed")
@@ -281,6 +288,66 @@ class WorkflowRunner:
             session,
             "intent.clarification_answered",
             {"request_id": request.id, "agent_run_id": agent_run_id},
+            run_id=run.id,
+        )
+        return WorkflowRunResult(run_id=run.id, output=content)
+
+    def _resume_agent_manual_review(self, session: Session, run: Run, answer: str) -> WorkflowRunResult:
+        normalized_answer = answer.strip()
+        if normalized_answer not in {"reviewed_continue", "cancel"}:
+            raise ValueError("Answer must be reviewed_continue or cancel")
+        request = pending_clarification_for_run(session, run.id)
+        if request is None:
+            raise ValueError(f"Run has no pending clarification: {run.id}")
+        answer_clarification(session, request, normalized_answer)
+        step = session.get(RunStep, request.step_id)
+        if step is None:
+            raise ValueError(f"Clarification step is missing: {request.step_id}")
+        step.status = "completed"
+        step.output_json = json.dumps({"content": normalized_answer}, ensure_ascii=False, sort_keys=True)
+        step.error = None
+        create_checkpoint(session, run_id=run.id, step=step, output=normalized_answer)
+        payload = _json_payload(run.result_json)
+        input_payload = _json_payload(run.input_json)
+        resume_issue = payload.get("resume_issue")
+        if not isinstance(resume_issue, dict):
+            resume_issue = input_payload.get("resume_issue")
+        if not isinstance(resume_issue, dict):
+            resume_issue = {}
+        agent_run_id = str(payload.get("agent_run_id") or input_payload.get("agent_run_id") or "")
+        review_payload = {
+            "decision": normalized_answer,
+            "resume_issue": resume_issue,
+            "clarification_request_id": request.id,
+            "review_run_id": run.id,
+        }
+        content = (
+            "Manual review accepted; AgentRun can be resumed."
+            if normalized_answer == "reviewed_continue"
+            else "Manual review cancelled; AgentRun was cancelled."
+        )
+        payload["content"] = content
+        payload["resume_manual_review"] = review_payload
+        run.status = "completed"
+        run.error = None
+        run.result_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        if agent_run_id:
+            agent_run = session.get(AgentRun, agent_run_id)
+            if agent_run is not None:
+                if normalized_answer == "cancel":
+                    agent_run.status = "cancelled"
+                    agent_run.stop_reason = "resume_manual_review_cancelled"
+                    agent_run.completed_at = utc_now()
+                else:
+                    agent_run.status = "failed"
+                    agent_run.stop_reason = "resume_manual_review_accepted"
+                    agent_run.completed_at = None
+                agent_run.heartbeat_at = utc_now()
+                agent_run.final_result_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        record_event(
+            session,
+            "agent.resume_manual_review_answered",
+            {"request_id": request.id, "agent_run_id": agent_run_id, "decision": normalized_answer},
             run_id=run.id,
         )
         return WorkflowRunResult(run_id=run.id, output=content)

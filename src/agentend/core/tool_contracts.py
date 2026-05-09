@@ -75,6 +75,12 @@ class ToolContract:
     artifact_policy: str = "none"
     audit_events: list[str] = field(default_factory=lambda: ["tool.called", "tool.completed"])
     enabled: bool = True
+    idempotent: bool = True
+    idempotency_key_supported: bool = False
+    preview_supported: bool = False
+    dry_run_supported: bool = False
+    compensation_supported: bool = False
+    compensation_hint: str = ""
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -91,12 +97,19 @@ class ToolContract:
             "artifact_policy": self.artifact_policy,
             "audit_events": self.audit_events,
             "enabled": self.enabled,
+            "idempotent": self.idempotent,
+            "idempotency_key_supported": self.idempotency_key_supported,
+            "preview_supported": self.preview_supported,
+            "dry_run_supported": self.dry_run_supported,
+            "compensation_supported": self.compensation_supported,
+            "compensation_hint": self.compensation_hint,
         }
 
 
 def contract_for_tool(tool: Tool, *, source: str = "builtin", enabled: bool = True) -> ToolContract:
     side_effect = BUILTIN_SIDE_EFFECTS.get(tool.name, "network_read" if source == "mcp" else "none")
     category = side_effect if side_effect != "none" else source
+    idempotency = idempotency_metadata(tool.name, side_effect)
     return ToolContract(
         name=tool.name,
         source=source,
@@ -106,6 +119,7 @@ def contract_for_tool(tool: Tool, *, source: str = "builtin", enabled: bool = Tr
         side_effect=side_effect,
         retryable=side_effect in {"network_read"},
         artifact_policy="capture_artifact" if tool.name in {"file.write_text", "browser.screenshot", "browser.click", "browser.type"} else "none",
+        **idempotency,
     )
 
 
@@ -114,6 +128,28 @@ def effective_side_effect(tool_name: str, input_data: dict[str, Any], default_si
         method = str(input_data.get("method", "GET")).upper()
         return "network_read" if method in HTTP_READ_METHODS else "network_write"
     return default_side_effect
+
+
+def idempotency_metadata(tool_name: str, side_effect: str) -> dict[str, Any]:
+    idempotent = side_effect in {"none", "local_read", "network_read"}
+    preview_supported = side_effect in {"local_write", "network_write", "external_write"}
+    dry_run_supported = tool_name in {"im.telegram.send_message", "im.telegram.send_file", "tools.generate"}
+    compensation_supported = False
+    compensation_hint = ""
+    if side_effect == "local_write":
+        compensation_hint = "Local writes may overwrite the same target; inspect diff or restore from artifact/history manually."
+    elif side_effect in {"network_write", "external_write"}:
+        compensation_hint = "External writes may be visible outside AgentEnd and may not be reversible."
+    elif side_effect == "local_execute":
+        compensation_hint = "Local execution may have arbitrary side effects; no automatic compensation is available."
+    return {
+        "idempotent": idempotent,
+        "idempotency_key_supported": False,
+        "preview_supported": preview_supported,
+        "dry_run_supported": dry_run_supported,
+        "compensation_supported": compensation_supported,
+        "compensation_hint": compensation_hint,
+    }
 
 
 def sync_tool_manifests(session: Session, contracts: list[ToolContract]) -> None:
@@ -145,12 +181,13 @@ def snapshot_tool_contracts(session: Session, run_id: str, contracts: list[ToolC
         sync_tool_manifests(session, contracts)
     rows = session.execute(select(ToolManifest).order_by(ToolManifest.name)).scalars().all()
     snapshots: list[ToolContractSnapshot] = []
+    contract_payloads = {contract.name: contract.to_json_dict() for contract in contracts or []}
     for row in rows:
         snapshot = ToolContractSnapshot(
             id=str(uuid4()),
             run_id=run_id,
             tool_name=row.name,
-            contract_json=json.dumps(manifest_to_dict(row), ensure_ascii=False, sort_keys=True),
+            contract_json=json.dumps(contract_payloads.get(row.name, manifest_to_dict(row)), ensure_ascii=False, sort_keys=True),
         )
         session.add(snapshot)
         snapshots.append(snapshot)
@@ -168,7 +205,7 @@ def snapshot_to_dict(row: ToolContractSnapshot) -> dict[str, Any]:
 
 
 def manifest_to_dict(row: ToolManifest) -> dict[str, Any]:
-    return {
+    payload = {
         "name": row.name,
         "source": row.source,
         "category": row.category,
@@ -183,3 +220,4 @@ def manifest_to_dict(row: ToolManifest) -> dict[str, Any]:
         "audit_events": json.loads(row.audit_events_json),
         "enabled": row.enabled == "true",
     }
+    return payload | idempotency_metadata(row.name, row.side_effect)

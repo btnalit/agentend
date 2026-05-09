@@ -4,6 +4,7 @@ import json
 
 from sqlalchemy import select
 
+from agentend.core.capabilities import query_executable_capabilities
 from agentend.db.models import Capability, ToolManifest
 from agentend.tools.base import ToolContext, ToolResult
 
@@ -17,11 +18,7 @@ class ToolsDiscoverTool:
         query = str(input_data["query"]).lower()
         capabilities = context.session.execute(select(Capability)).scalars().all()
         if capabilities:
-            matches = [
-                capability
-                for capability in capabilities
-                if query in capability.name.lower() or query in capability.action_summary.lower()
-            ]
+            matches = query_executable_capabilities(context.session, query)
             payload = [{"name": item.name, "source": item.source, "side_effect": item.side_effect} for item in matches]
         else:
             manifests = context.session.execute(select(ToolManifest).where(ToolManifest.enabled == "true")).scalars().all()

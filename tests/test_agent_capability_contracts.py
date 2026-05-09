@@ -55,3 +55,32 @@ def test_capability_contract_for_shell_run_describes_test_evidence() -> None:
     assert "test_command_evidence" in contract["evidence_produced"]
     assert contract["verification_hints"]
     assert "command_failed" in contract["failure_modes"]
+
+
+def test_selector_honors_pure_capability_policy_without_legacy_candidate_lists(tmp_path: Path) -> None:
+    home = tmp_path / "agentend-home"
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--home", str(home)]).exit_code == 0
+    goal_analysis = {
+        "candidate_capabilities": [
+            {"id": "shell.run", "type": "tool", "executable": True},
+            {"id": "fs.read_text", "type": "tool", "executable": True},
+            {"id": "code.local_task", "type": "skill", "executable": True},
+        ],
+        "allowed_capabilities": ["fs.read_text"],
+    }
+
+    with session_scope(home) as session:
+        result = select_next_action_with_trace(
+            home,
+            session,
+            "Use the permitted capability to inspect project context.",
+            goal_analysis,
+            [],
+        )
+
+    assert result.selected.type == "tool_call"
+    assert result.selected.name == "fs.read_text"
+    rejected = {item["name"]: item["rejected_reasons"] for item in result.trace["candidates"]}
+    assert "capability not allowed by allowed_capabilities" in rejected["shell.run"]
+    assert "capability not allowed by allowed_capabilities" in rejected["code.local_task"]
