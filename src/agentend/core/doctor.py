@@ -187,7 +187,7 @@ def _check_browser() -> DoctorCheck:
         "browser_playwright",
         "warning",
         result.message,
-        "Install Playwright, then on Linux run: python -m playwright install --with-deps chromium",
+        "Install the browser extra, then on Linux run: python -m playwright install --with-deps chromium",
     )
 
 

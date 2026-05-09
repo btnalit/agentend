@@ -26,9 +26,27 @@ def test_linux_deploy_artifacts_are_present() -> None:
     service = root / "deploy" / "agentend.service"
     installer = root / "scripts" / "install-linux.sh"
     readme = root / "README.md"
+    env_example = root / ".env.example"
 
     assert service.exists()
     assert "agentend telegram serve" in service.read_text(encoding="utf-8")
     assert installer.exists()
-    assert "agentend init --home" in installer.read_text(encoding="utf-8")
-    assert "systemd" in readme.read_text(encoding="utf-8")
+    installer_text = installer.read_text(encoding="utf-8")
+    assert "agentend init --home" in installer_text
+    assert "python -m pip install -e \"$INSTALL_SPEC\"" in installer_text
+    assert "python3 -m venv .venv" in installer_text
+    assert ".[dev]" not in installer_text
+    assert env_example.exists()
+    assert "TELEGRAM_BOT_TOKEN=" in env_example.read_text(encoding="utf-8")
+    readme_text = readme.read_text(encoding="utf-8")
+    assert "systemd" in readme_text
+    assert "python -m pip install -e ." in readme_text
+
+
+def test_runtime_install_does_not_require_playwright() -> None:
+    root = Path(__file__).resolve().parents[1]
+    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+    dependencies = pyproject.split("[project.optional-dependencies]", maxsplit=1)[0]
+
+    assert "playwright" not in dependencies
+    assert "browser = [" in pyproject

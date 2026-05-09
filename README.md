@@ -18,7 +18,7 @@ AgentEnd Lite 是一个 Python 单机 Agent 工作流运行时，提供 CLI 和 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -e '.[dev]'
+python -m pip install -e .
 
 agentend init
 agentend llm set --provider fake --model fake-model
@@ -168,7 +168,7 @@ cd /opt/agentend
 
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -e '.[dev]'
+python -m pip install -e .
 agentend init --home /opt/agentend
 cp .env.example .env
 ```
@@ -185,6 +185,25 @@ TELEGRAM_BOT_TOKEN=
 ```bash
 bash scripts/install-linux.sh /opt/agentend
 ```
+
+`scripts/install-linux.sh` 默认只安装运行时依赖，不安装 dev/test 依赖。需要测试依赖时使用：
+
+```bash
+AGENTEND_INSTALL_SPEC='.[dev]' bash scripts/install-linux.sh /opt/agentend
+```
+
+Playwright 不再是基础依赖。只有需要 browser Playwright 后端时安装：
+
+```bash
+python -m pip install -e '.[browser]'
+python -m playwright install chromium
+```
+
+OpenWrt / musl 环境注意事项：
+
+- `python3 -m venv` 报 `No module named venv` 时，先安装系统提供的 venv 包；如果镜像没有该包，建议换到带完整 Python 的环境或容器中部署。
+- musl + Python 3.13 通常没有可用的 Playwright wheel，所以不要在 OpenWrt 上安装 `.[browser]` 或旧的 `.[dev]` 路径。
+- OpenWrt 不使用 systemd，下面的 `deploy/agentend.service` 只适用于 systemd 发行版；OpenWrt 需要用 procd/init.d，或先手工运行 `agentend telegram serve --home /opt/agentend`。
 
 安装 systemd service：
 
@@ -209,7 +228,7 @@ agentend db backup --home /opt/agentend --output /opt/agentend/backups/agentend.
 cd /opt/agentend
 git pull
 . .venv/bin/activate
-python -m pip install -e '.[dev]'
+python -m pip install -e .
 agentend db init --home /opt/agentend
 sudo systemctl restart agentend
 ```
