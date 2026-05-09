@@ -237,7 +237,7 @@ EOF
 
 install_python_runtime() {
   ensure_python_base_modules
-  if python3 -m venv .venv; then
+  if python3 -m venv .venv 2>/dev/null; then
     install_venv_runtime
   else
     install_target_runtime
