@@ -252,7 +252,19 @@ def _looks_like_raw_tool_output(text: str) -> bool:
         "stdout",
         "workspace",
     }
-    return bool(raw_keys.intersection(payload))
+    if raw_keys.intersection(payload):
+        return True
+    # Parallel-node results aggregate per-node outputs as JSON-encoded strings;
+    # check one level deep so skill results are also caught.
+    for value in payload.values():
+        if isinstance(value, str):
+            try:
+                nested = json.loads(value)
+                if isinstance(nested, dict) and raw_keys.intersection(nested):
+                    return True
+            except json.JSONDecodeError:
+                pass
+    return False
 
 
 def _pending_goal_keyboard(home: Path, external_user_id: str):
