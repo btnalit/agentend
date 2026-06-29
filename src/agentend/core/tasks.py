@@ -278,7 +278,7 @@ class TaskManager:
             existing = session.execute(
                 select(TaskItem)
                 .where(TaskItem.agent_run_id == agent_run_id)
-                .where(TaskItem.status == "pending")
+                .where(TaskItem.status.in_(["pending", "running"]))
             ).scalars().first()
             if existing:
                 return None

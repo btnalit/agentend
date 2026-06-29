@@ -43,11 +43,21 @@ class AgentWorker:
             with session_scope(self.home) as session:
                 agent_run = session.get(AgentRun, task.agent_run_id)
             if agent_run and agent_run.status == "waiting_input":
-                result = AgentRunController(self.home).resume(
-                    task.agent_run_id,
-                    max_iterations=3,
-                    run_mode=task.run_mode,
-                )
+                try:
+                    result = AgentRunController(self.home).resume(
+                        task.agent_run_id,
+                        max_iterations=3,
+                        run_mode=task.run_mode,
+                    )
+                except (ValueError, Exception) as exc:
+                    self._fail_task(task.id, reason=f"resume_error: {exc}")
+                    return WorkerResult(
+                        processed_tasks=1,
+                        created_tasks=created_from_schedules + created_from_inbox,
+                        schedule_count=created_from_schedules,
+                        agent_run_ids=[task.agent_run_id],
+                        message="resume_failed",
+                    )
             else:
                 self._fail_task(task.id, reason="agent_run not waiting_input")
                 return WorkerResult(
