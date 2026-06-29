@@ -440,7 +440,9 @@ class AgentRunController:
 
         with session_scope(self.home) as session:
             self._record_memory_use_events(session, agent_run_id)
-            consolidate_memory_candidates(session, agent_run_id=agent_run_id)
+            _cfg = load_config(self.home)
+            _hermes_home = Path(_cfg.hermes_home) if _cfg.hermes_home else None
+            consolidate_memory_candidates(session, agent_run_id=agent_run_id, hermes_home=_hermes_home)
 
         assert final is not None
         return final

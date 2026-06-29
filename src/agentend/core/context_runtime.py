@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
@@ -22,6 +24,12 @@ from agentend.db.models import (
     RunStep,
 )
 from agentend.tools.base import ToolResult
+
+logger = logging.getLogger(__name__)
+
+# Cached MemoryOSProvider instances, keyed by hermes_home.  Avoids repeated
+# initialize() calls across multiple build_context_pack invocations.
+_hermes_provider_cache: dict[str, Any] = {}
 
 
 @dataclass(frozen=True)
@@ -150,6 +158,21 @@ def build_context_pack(
         items.append(ContextItem("workflow", workflow.id, workflow.name))
     if prompt:
         items.append(ContextItem("prompt", "workflow_step", prompt))
+    # Hermes recall injection (fail-closed)
+    if config.hermes_home:
+        try:
+            _provider = _get_hermes_provider(config.hermes_home)
+            if _provider is not None:
+                # TODO: pass real session_id when available in build_context_pack signature
+                _recall = _provider.prefetch(user_input, session_id="")
+                if _recall:
+                    items.append(ContextItem(
+                        item_type="memory",
+                        source="hermes_recall",
+                        summary=_recall,
+                    ))
+        except Exception:
+            logger.warning("Hermes recall failed for user_input=%r", user_input[:50], exc_info=True)
     dropped: list[DroppedContextItem] = []
     if session is not None and policy.get("include_memory", True):
         memory_scopes = set(policy.get("memory_scopes") or [])
@@ -269,6 +292,8 @@ def _dropped_memory(scope: str, content: str, reason: str) -> DroppedContextItem
 
 
 def _default_trust_metadata(item_type: str, source: str) -> tuple[str, str, tuple[str, ...]]:
+    if source == "hermes_recall":
+        return "external_recall", "external_recall", ("answer_context", "evidence")
     if item_type in {"context_policy", "fixed"}:
         return "system", "trusted", ("instruction", "answer_context")
     if item_type == "workflow":
@@ -286,6 +311,54 @@ def _default_trust_metadata(item_type: str, source: str) -> tuple[str, str, tupl
     if item_type == "file":
         return "file", "external_untrusted", ("evidence", "answer_context")
     return "generated", "generated", ("answer_context",)
+
+
+def _get_hermes_provider(hermes_home: str) -> Any | None:
+    """Return a cached and initialized MemoryOSProvider for *hermes_home*.
+
+    Returns ``None`` if Hermes is not available or cannot be initialized.
+    The provider is cached per *hermes_home* to avoid repeated ``initialize()``
+    calls across multiple ``build_context_pack`` invocations.
+    """
+    if hermes_home in _hermes_provider_cache:
+        return _hermes_provider_cache[hermes_home]
+
+    # Short-circuit if the Hermes adapter has already determined Hermes is unavailable.
+    try:
+        from agentend.hermes.adapter import _HERMES_AVAILABLE as _ha
+        if not _ha:
+            _hermes_provider_cache[hermes_home] = None
+            return None
+    except ImportError:
+        pass  # adapter not importable — attempt direct path injection below
+
+    import sys as _sys
+
+    _hermes_path = str(Path(__file__).parent.parent.parent.parent / "Hermes-Memory-OS-main")
+    _path_added = False
+    if _hermes_path not in _sys.path:
+        _sys.path.insert(0, _hermes_path)
+        _path_added = True
+    try:
+        from plugins.memory.memory_os import MemoryOSProvider as _MOP  # noqa
+    except ImportError:
+        # Clean up the path we just added so we don't shadow other packages.
+        if _path_added:
+            try:
+                _sys.path.remove(_hermes_path)
+            except ValueError:
+                pass
+        _hermes_provider_cache[hermes_home] = None
+        return None
+
+    provider = _MOP()
+    provider.initialize(
+        session_id="",  # TODO: pass real session_id when available in build_context_pack signature
+        hermes_home=str(Path(hermes_home)),
+        worker_autostart=False,
+    )
+    _hermes_provider_cache[hermes_home] = provider
+    return provider
 
 
 def _select_with_budget(items: list[ContextItem], policy: dict) -> tuple[list[ContextItem], list[DroppedContextItem]]:

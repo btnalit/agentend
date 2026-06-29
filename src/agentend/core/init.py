@@ -59,6 +59,9 @@ artifact_dir = "./data/artifacts"
 log_dir = "./data/logs"
 agent_profile_path = "./agent.md"
 workflow_dir = "./workflows/definitions"
+
+[hermes]
+home = ""
 """
 
 

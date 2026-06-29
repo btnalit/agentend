@@ -73,6 +73,7 @@ class AppConfig:
     data: DataConfig
     search: SearchConfig
     vision: VisionConfig
+    hermes_home: str = ""
 
     def resolve_home_path(self, value: str) -> Path:
         path = Path(value)
@@ -171,7 +172,9 @@ def load_config(home: Path) -> AppConfig:
     )
     vision = VisionConfig(provider=str(vision_section.get("provider", "fake")), providers=vision_providers)
     _load_env_file(resolved_home / ".env")
-    return AppConfig(home=resolved_home, llm=llm, data=data, search=search, vision=vision)
+    hermes_section = raw.get("hermes", {})
+    hermes_home = str(hermes_section.get("home", ""))
+    return AppConfig(home=resolved_home, llm=llm, data=data, search=search, vision=vision, hermes_home=hermes_home)
 
 
 def set_llm_config(home: Path, provider: str, model: str, *, api_key_env: str | None = None, base_url: str | None = None) -> AppConfig:

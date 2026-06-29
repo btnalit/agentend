@@ -71,6 +71,7 @@ def consolidate_memory_candidates(
     run_id: str | None = None,
     auto_relations: bool = True,
     home: Path | None = None,
+    hermes_home: Path | None = None,
 ) -> ConsolidationResult:
     candidates = extract_memory_candidates(session, agent_run_id=agent_run_id, run_id=run_id)
     classifier = MemoryRelationClassifier(home)
@@ -201,6 +202,28 @@ def consolidate_memory_candidates(
             else:
                 merged += 1
             memory_ids.append(existing.id)
+    # Hermes retain — when hermes_home is set and we have an agent_run_id, write
+    # a summary-only EventEnvelope to the Hermes store.  Failures are logged and
+    # suppressed so consolidation always completes.
+    if hermes_home and agent_run_id:
+        try:
+            from agentend.hermes.adapter import retain_agent_run
+            _agent_run = session.get(AgentRun, agent_run_id)
+            _iters = (
+                list(
+                    session.execute(
+                        select(AgentIteration).where(AgentIteration.agent_run_id == agent_run_id)
+                    ).scalars().all()
+                )
+                if _agent_run
+                else []
+            )
+            if _agent_run:
+                retain_agent_run(_agent_run, _iters, hermes_home)
+        except Exception:
+            import logging as _logging
+            _logging.getLogger(__name__).warning("Hermes retain error in consolidator", exc_info=True)
+
     return ConsolidationResult(
         candidate_count=len(candidates),
         created_count=created,

@@ -1214,6 +1214,7 @@ def memory_consolidate(
                 run_id=run_id,
                 auto_relations=auto_relations,
                 home=resolved_home,
+                hermes_home=None,
             )
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
