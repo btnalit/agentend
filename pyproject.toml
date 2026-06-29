@@ -33,6 +33,9 @@ agentend = "agentend.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"agentend.hermes.memory_os" = ["plugin.yaml"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 asyncio_mode = "auto"
