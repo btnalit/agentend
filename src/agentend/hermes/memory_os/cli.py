@@ -675,7 +675,7 @@ def _hermes_contract_checks() -> list[dict[str, Any]]:
 
     # Check 1: register(ctx) entry point
     try:
-        mod = importlib.import_module("plugins.memory.memory_os.__init__")
+        mod = importlib.import_module("agentend.hermes.memory_os")
         has_register = hasattr(mod, "register") and callable(mod.register)
     except ImportError:
         has_register = False
