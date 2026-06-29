@@ -273,9 +273,10 @@ class TaskManager:
         *,
         run_mode: str = "normal",
         answer_text: str = "",
+        session=None,
     ) -> "TaskItem | None":
-        with session_scope(self.home) as session:
-            existing = session.execute(
+        def _do(s):
+            existing = s.execute(
                 select(TaskItem)
                 .where(TaskItem.agent_run_id == agent_run_id)
                 .where(TaskItem.status.in_(["pending", "running"]))
@@ -292,8 +293,13 @@ class TaskManager:
                 agent_run_id=agent_run_id,
                 run_mode=run_mode,
             )
-            session.add(task)
+            s.add(task)
             return task
+
+        if session is not None:
+            return _do(session)
+        with session_scope(self.home) as s:
+            return _do(s)
 
     def scan_inbox_once(
         self,

@@ -199,7 +199,10 @@ class TelegramMessageRouter:
                 answer_clarification(session, clarification, "approve")
             except ValueError as exc:
                 return f"审批失败：{exc}"
-        TaskManager(self.home).enqueue_resume_intent(agent_run_id, run_mode="normal", answer_text="approve")
+            # Enqueue inside the same session → atomic with answer_clarification commit
+            TaskManager(self.home).enqueue_resume_intent(
+                agent_run_id, run_mode="normal", answer_text="approve", session=session
+            )
         return f"✅ 已批准，目标 {agent_run_id[:8]} 继续运行。"
 
     def reject_clarification(self, request_id: str, agent_run_id: str) -> str:
@@ -329,11 +332,13 @@ def serve_telegram(home: Path) -> None:
         for chunk in _split_telegram_message(reply):
             await update.message.reply_text(chunk)
 
-        # After normal reply, show pending approval if any (with buttons)
-        pending = _pending_goal_keyboard(home, _telegram_external_user_id(chat_id_str, tg_user_id))
-        if pending:
-            goal_text, keyboard = pending
-            await update.message.reply_text(goal_text, reply_markup=keyboard)
+        # After normal reply, show pending approval if any (with buttons).
+        # Bug 4 fix: skip keyboard if reply already contains a goal view (avoids stacked keyboards)
+        if "🎯" not in reply and "⏸" not in reply:
+            pending = _pending_goal_keyboard(home, _telegram_external_user_id(chat_id_str, tg_user_id))
+            if pending:
+                goal_text, keyboard = pending
+                await update.message.reply_text(goal_text, reply_markup=keyboard)
 
     app = Application.builder().token(token).build()
     app.add_handler(MessageHandler(filters.TEXT, handle_message))
@@ -352,21 +357,42 @@ def serve_telegram(home: Path) -> None:
             return
         action, request_id = parts
 
-        # 通过 request_id 找 run_id，再找 agent_run_id
+        # Bug 2 fix: move all awaits outside the session_scope block
+        agent_run_id: str | None = None
+        early_exit_msg: str | None = None
         with session_scope(home) as session:
             clarification = session.get(ClarificationRequest, request_id)
             if clarification is None:
-                await query.edit_message_text("审批请求不存在。")
+                early_exit_msg = "审批请求不存在。"
+            else:
+                iteration = session.execute(
+                    select(AgentIteration)
+                    .where(AgentIteration.linked_run_id == clarification.run_id)
+                    .order_by(desc(AgentIteration.created_at))
+                ).scalars().first()
+                if iteration is None:
+                    early_exit_msg = "找不到关联目标。"
+                else:
+                    agent_run_id = iteration.agent_run_id
+
+        if early_exit_msg is not None:
+            await query.edit_message_text(early_exit_msg)
+            return
+
+        # Bug 1 fix: verify caller owns the run
+        if query.from_user is None:
+            await query.edit_message_text("无法验证身份。")
+            return
+        effective_chat_id = (
+            str(update.effective_chat.id) if update.effective_chat is not None
+            else (str(query.message.chat.id) if query.message is not None else "")
+        )
+        caller_external_id = _telegram_external_user_id(effective_chat_id, str(query.from_user.id))
+        with session_scope(home) as session:
+            ar = session.get(AgentRun, agent_run_id)
+            if ar is None or ar.external_user_id != caller_external_id:
+                await query.edit_message_text("您无权操作此审批。")
                 return
-            iteration = session.execute(
-                select(AgentIteration)
-                .where(AgentIteration.linked_run_id == clarification.run_id)
-                .order_by(desc(AgentIteration.created_at))
-            ).scalars().first()
-            if iteration is None:
-                await query.edit_message_text("找不到关联目标。")
-                return
-            agent_run_id = iteration.agent_run_id
 
         if action == "approve":
             reply = router_ref.approve_clarification(request_id, agent_run_id)
