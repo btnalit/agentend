@@ -2,33 +2,19 @@
 from __future__ import annotations
 
 import logging
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Inject Hermes source directory so plugins.memory.memory_os.* imports work in-process.
-# The path insertion is wrapped in the same try/except so it is undone if the imports fail,
-# keeping sys.path clean on environments that do not have Hermes installed.
-_path_added = False
 try:
-    _hermes_path = str(Path(__file__).parent.parent.parent.parent / "Hermes-Memory-OS-main")
-    if _hermes_path not in sys.path:
-        sys.path.insert(0, _hermes_path)
-        _path_added = True
-    from plugins.memory.memory_os.roots import MemoryOSRoots
-    from plugins.memory.memory_os.store import MemoryOSStore
-    from plugins.memory.memory_os.schema import EventEnvelope, EVENT_SCHEMA_VERSION
-    from plugins.memory.memory_os.ids import new_event_id
+    from agentend.hermes.memory_os.roots import MemoryOSRoots
+    from agentend.hermes.memory_os.store import MemoryOSStore
+    from agentend.hermes.memory_os.schema import EventEnvelope, EVENT_SCHEMA_VERSION
+    from agentend.hermes.memory_os.ids import new_event_id
     _HERMES_AVAILABLE = True
 except ImportError:
-    if _path_added:
-        try:
-            sys.path.remove(_hermes_path)
-        except ValueError:
-            pass
     _HERMES_AVAILABLE = False
     MemoryOSRoots = None  # type: ignore[assignment]
     MemoryOSStore = None  # type: ignore[assignment]

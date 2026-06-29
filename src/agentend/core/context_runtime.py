@@ -323,31 +323,9 @@ def _get_hermes_provider(hermes_home: str) -> Any | None:
     if hermes_home in _hermes_provider_cache:
         return _hermes_provider_cache[hermes_home]
 
-    # Short-circuit if the Hermes adapter has already determined Hermes is unavailable.
     try:
-        from agentend.hermes.adapter import _HERMES_AVAILABLE as _ha
-        if not _ha:
-            _hermes_provider_cache[hermes_home] = None
-            return None
+        from agentend.hermes.memory_os import MemoryOSProvider as _MOP  # noqa
     except ImportError:
-        pass  # adapter not importable — attempt direct path injection below
-
-    import sys as _sys
-
-    _hermes_path = str(Path(__file__).parent.parent.parent.parent / "Hermes-Memory-OS-main")
-    _path_added = False
-    if _hermes_path not in _sys.path:
-        _sys.path.insert(0, _hermes_path)
-        _path_added = True
-    try:
-        from plugins.memory.memory_os import MemoryOSProvider as _MOP  # noqa
-    except ImportError:
-        # Clean up the path we just added so we don't shadow other packages.
-        if _path_added:
-            try:
-                _sys.path.remove(_hermes_path)
-            except ValueError:
-                pass
         _hermes_provider_cache[hermes_home] = None
         return None
 

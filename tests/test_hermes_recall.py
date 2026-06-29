@@ -34,71 +34,47 @@ def test_hermes_recall_context_item_cannot_override_policy() -> None:
 # ---------------------------------------------------------------------------
 
 def test_get_hermes_provider_returns_none_when_hermes_unavailable(monkeypatch) -> None:
-    """When Hermes is not available, _get_hermes_provider returns None without leaking sys.path."""
-    cr._hermes_provider_cache.clear()
-
-    # Simulate Hermes not installed by patching the adapter flag.
-    import agentend.hermes.adapter as _adapter
-    monkeypatch.setattr(_adapter, "_HERMES_AVAILABLE", False)
-
-    path_before = sys.path.copy()
-    result = cr._get_hermes_provider("/nonexistent/hermes_home")
-
-    assert result is None
-    assert sys.path == path_before, "sys.path must not be modified when Hermes is unavailable"
-
-
-def test_get_hermes_provider_cached_on_second_call(monkeypatch) -> None:
-    """_get_hermes_provider returns the cached value without re-importing on subsequent calls."""
-    cr._hermes_provider_cache.clear()
-
-    import agentend.hermes.adapter as _adapter
-    monkeypatch.setattr(_adapter, "_HERMES_AVAILABLE", False)
-
-    result1 = cr._get_hermes_provider("/hermes_home_a")
-    result2 = cr._get_hermes_provider("/hermes_home_a")
-
-    assert result1 is None
-    assert result2 is None
-    # Verify it is in the cache
-    assert "/hermes_home_a" in cr._hermes_provider_cache
-
-
-def test_get_hermes_provider_path_cleaned_up_on_import_error(monkeypatch) -> None:
-    """When the Hermes MemoryOSProvider import fails, the injected sys.path entry is removed."""
-    from pathlib import Path
+    """When the MemoryOSProvider import fails, _get_hermes_provider returns None."""
     from unittest.mock import patch
 
     cr._hermes_provider_cache.clear()
 
-    # Make _HERMES_AVAILABLE True so we bypass the short-circuit and reach path injection.
-    import agentend.hermes.adapter as _adapter
-    monkeypatch.setattr(_adapter, "_HERMES_AVAILABLE", True)
+    path_before = sys.path.copy()
+    # Block agentend.hermes.memory_os so the import inside _get_hermes_provider raises.
+    with patch.dict(sys.modules, {"agentend.hermes.memory_os": None}):
+        result = cr._get_hermes_provider("/nonexistent/hermes_home")
 
-    hermes_path = str(Path(cr.__file__).parent.parent.parent.parent / "Hermes-Memory-OS-main")
+    assert result is None
+    assert sys.path == path_before, "sys.path must never be modified (Hermes is now a subpackage)"
 
-    # Save and strip hermes_path so _path_added becomes True inside the helper.
-    saved_path = list(sys.path)
-    while hermes_path in sys.path:
-        sys.path.remove(hermes_path)
 
-    # Force ImportError by hiding the target module in sys.modules cache.
-    # Python's import machinery raises ModuleNotFoundError when sys.modules[key] is None.
-    blocking = {
-        "plugins.memory.memory_os": None,
-    }
+def test_get_hermes_provider_cached_on_second_call(monkeypatch) -> None:
+    """_get_hermes_provider caches None on ImportError and returns the cached value on retry."""
+    from unittest.mock import patch
 
-    try:
-        with patch.dict(sys.modules, blocking):
-            result = cr._get_hermes_provider("/fake/hermes_home_path_cleanup_test")
-        # Assert BEFORE finally restores sys.path (saved_path still contains hermes_path).
-        assert result is None
-        assert hermes_path not in sys.path, (
-            "sys.path must not retain the injected Hermes path after ImportError"
-        )
-    finally:
-        # Restore sys.path regardless of outcome.
-        sys.path[:] = saved_path
+    cr._hermes_provider_cache.clear()
+
+    with patch.dict(sys.modules, {"agentend.hermes.memory_os": None}):
+        result1 = cr._get_hermes_provider("/hermes_home_a")
+        # Second call must hit cache, not re-import.
+        result2 = cr._get_hermes_provider("/hermes_home_a")
+
+    assert result1 is None
+    assert result2 is None
+    assert "/hermes_home_a" in cr._hermes_provider_cache
+
+
+def test_get_hermes_provider_does_not_modify_sys_path_on_import_error() -> None:
+    """_get_hermes_provider never modifies sys.path — Hermes is now a bundled subpackage."""
+    from unittest.mock import patch
+
+    cr._hermes_provider_cache.clear()
+
+    path_before = sys.path.copy()
+    with patch.dict(sys.modules, {"agentend.hermes.memory_os": None}):
+        cr._get_hermes_provider("/fake/hermes_home_no_path_change")
+
+    assert sys.path == path_before, "sys.path must be identical before and after the call"
 
 
 def test_hermes_recall_exception_logs_warning(monkeypatch, caplog, tmp_path) -> None:
