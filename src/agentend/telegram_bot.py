@@ -318,8 +318,7 @@ def serve_telegram(home: Path) -> None:
             await update.message.reply_text(chunk)
 
         # After normal reply, show pending approval if any (with buttons)
-        external_user_id = f"tg:{update.effective_chat.id}:{update.effective_user.id}"
-        pending = _pending_goal_keyboard(home, external_user_id)
+        pending = _pending_goal_keyboard(home, _telegram_external_user_id(chat_id_str, tg_user_id))
         if pending:
             goal_text, keyboard = pending
             await update.message.reply_text(goal_text, reply_markup=keyboard)
