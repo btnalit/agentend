@@ -269,6 +269,8 @@ def _dropped_memory(scope: str, content: str, reason: str) -> DroppedContextItem
 
 
 def _default_trust_metadata(item_type: str, source: str) -> tuple[str, str, tuple[str, ...]]:
+    if source == "hermes_recall":
+        return "external_recall", "external_recall", ("answer_context", "evidence")
     if item_type in {"context_policy", "fixed"}:
         return "system", "trusted", ("instruction", "answer_context")
     if item_type == "workflow":
