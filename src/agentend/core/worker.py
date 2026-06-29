@@ -49,7 +49,7 @@ class AgentWorker:
                         max_iterations=3,
                         run_mode=task.run_mode,
                     )
-                except (ValueError, Exception) as exc:
+                except Exception as exc:
                     self._fail_task(task.id, reason=f"resume_error: {exc}")
                     return WorkerResult(
                         processed_tasks=1,

@@ -4,14 +4,22 @@ Bug 1: resume() ValueError must be caught; worker must not crash.
 Bug 2: enqueue_resume_intent must treat 'running' tasks as already-enqueued.
 """
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
+from sqlalchemy import select
 from typer.testing import CliRunner
 
 from agentend.cli import app
 from agentend.core.worker import AgentWorker
-from agentend.db.models import AgentRun, TaskItem
+from agentend.db.models import (
+    AgentIteration,
+    AgentRun,
+    ClarificationRequest,
+    Conversation,
+    Run,
+    TaskItem,
+)
 from agentend.db.session import session_scope
 
 
@@ -135,7 +143,6 @@ def test_enqueue_resume_intent_deduplicates_running_task(tmp_path: Path) -> None
     assert task2 is None
 
     # Only one task should exist in DB for this run
-    from sqlalchemy import select
     with session_scope(home) as session:
         count = len(
             session.execute(
@@ -143,3 +150,74 @@ def test_enqueue_resume_intent_deduplicates_running_task(tmp_path: Path) -> None
             ).scalars().all()
         )
     assert count == 1
+
+
+# ---------------------------------------------------------------------------
+# End-to-end integration: approve → enqueue → worker → resume (Finding 2)
+# ---------------------------------------------------------------------------
+
+def test_approve_then_worker_resumes_run(tmp_path: Path) -> None:
+    """Full path: approve_clarification → TaskItem in DB → AgentWorker.run_once() → resume() called."""
+    from agentend.telegram_bot import TelegramMessageRouter
+
+    home = _init_home(tmp_path)
+
+    # Set up DB fixtures: AgentRun waiting for input, linked ClarificationRequest
+    agent_run_id = str(uuid4())
+    linked_run_id = str(uuid4())
+    conv_id = str(uuid4())
+    iter_id = str(uuid4())
+    req_id = str(uuid4())
+
+    with session_scope(home) as session:
+        session.add(Conversation(
+            id=conv_id, channel="telegram", external_user_id="100:42",
+        ))
+        session.add(Run(
+            id=linked_run_id, conversation_id=conv_id, workflow_id="simple_chat",
+            status="waiting_input", input_json="{}", result_json="{}",
+            agent_profile_path="", agent_profile_hash="",
+            llm_provider="fake", llm_model="fake",
+        ))
+        session.add(AgentRun(
+            id=agent_run_id, channel="telegram", external_user_id="100:42",
+            goal="integration test goal", status="waiting_input",
+            stop_reason="clarification_required", max_iterations=3,
+        ))
+        session.add(AgentIteration(
+            id=iter_id, agent_run_id=agent_run_id, iteration_index=1,
+            status="waiting", linked_run_id=linked_run_id,
+        ))
+        session.add(ClarificationRequest(
+            id=req_id, run_id=linked_run_id, step_id=iter_id,
+            request_type="tool_confirm", question="确认操作？",
+            status="pending", resume_token=str(uuid4()),
+            free_text_allowed="true",
+        ))
+
+    # Step 1: approve_clarification must succeed and create a TaskItem
+    router = TelegramMessageRouter(home)
+    msg = router.approve_clarification(req_id, agent_run_id)
+    assert "已批准" in msg or "✅" in msg
+
+    # Step 2: verify TaskItem exists with status=pending
+    with session_scope(home) as session:
+        task = session.execute(
+            select(TaskItem).where(TaskItem.agent_run_id == agent_run_id)
+        ).scalars().first()
+    assert task is not None, "TaskItem must be created after approve_clarification"
+    assert task.status == "pending"
+
+    # Step 3: AgentWorker.run_once() must call resume() with the correct agent_run_id
+    mock_result = MagicMock()
+    mock_result.agent_run_id = agent_run_id
+
+    with patch("agentend.core.worker.AgentRunController") as MockCtrl:
+        MockCtrl.return_value.resume.return_value = mock_result
+        worker_result = AgentWorker(home).run_once()
+
+    # Step 4: verify resume() was called with the correct arguments
+    MockCtrl.return_value.resume.assert_called_once_with(
+        agent_run_id, max_iterations=3, run_mode="normal"
+    )
+    assert worker_result.processed_tasks == 1

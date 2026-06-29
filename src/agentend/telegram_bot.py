@@ -391,6 +391,7 @@ def serve_telegram(home: Path) -> None:
             await query.edit_message_text(early_exit_msg)
             return
 
+        assert agent_run_id is not None  # guaranteed by early_exit_msg guard above
         if action == "approve":
             reply = router_ref.approve_clarification(request_id, agent_run_id)
         else:
