@@ -150,6 +150,25 @@ def build_context_pack(
         items.append(ContextItem("workflow", workflow.id, workflow.name))
     if prompt:
         items.append(ContextItem("prompt", "workflow_step", prompt))
+    # Hermes recall injection (fail-closed)
+    if config.hermes_home:
+        try:
+            import sys as _sys
+            _hermes_path = str(Path(__file__).parent.parent.parent.parent / "Hermes-Memory-OS-main")
+            if _hermes_path not in _sys.path:
+                _sys.path.insert(0, _hermes_path)
+            from plugins.memory.memory_os import MemoryOSProvider  # noqa
+            _provider = MemoryOSProvider()
+            _provider.initialize(session_id="", hermes_home=str(Path(config.hermes_home)), worker_autostart=False)
+            _recall = _provider.prefetch(user_input, session_id="")
+            if _recall:
+                items.append(ContextItem(
+                    item_type="memory",
+                    source="hermes_recall",
+                    summary=_recall,
+                ))
+        except Exception:
+            pass  # degrade not crash
     dropped: list[DroppedContextItem] = []
     if session is not None and policy.get("include_memory", True):
         memory_scopes = set(policy.get("memory_scopes") or [])

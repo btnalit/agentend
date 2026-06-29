@@ -541,7 +541,7 @@ def _run_memory_consolidation_suite(home: Path) -> dict[str, object]:
         max_iterations=2,
     )
     with session_scope(home) as session:
-        consolidation = consolidate_memory_candidates(session, agent_run_id=result.agent_run_id)
+        consolidation = consolidate_memory_candidates(session, agent_run_id=result.agent_run_id, hermes_home=None)
         candidates = (
             session.execute(select(MemoryCandidate).where(MemoryCandidate.agent_run_id == result.agent_run_id))
             .scalars()

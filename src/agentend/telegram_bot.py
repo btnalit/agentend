@@ -186,8 +186,7 @@ class TelegramMessageRouter:
                     clarification = pending_clarification_for_run(session, iteration.linked_run_id)
                     if clarification:
                         lines.append(f"\n⏸ 等待审批：{clarification.question}")
-                        lines.append(f"approve:{clarification.id}")
-                        lines.append(f"reject:{clarification.id}")
+                        lines.append("👆 请使用下方按钮审批")
 
             return "\n".join(lines)
 
@@ -256,6 +255,43 @@ def _looks_like_raw_tool_output(text: str) -> bool:
     return bool(raw_keys.intersection(payload))
 
 
+def _pending_goal_keyboard(home: Path, external_user_id: str):
+    """Return (goal_text, InlineKeyboardMarkup) if user has a pending approval, else None."""
+    try:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        with session_scope(home) as session:
+            # Find latest waiting_input AgentRun for this user
+            agent_run = session.execute(
+                select(AgentRun)
+                .where(AgentRun.external_user_id == external_user_id)
+                .where(AgentRun.status == "waiting_input")
+                .order_by(desc(AgentRun.created_at))
+            ).scalars().first()
+            if agent_run is None:
+                return None
+            # D8: lookup via AgentIteration.linked_run_id
+            iteration = session.execute(
+                select(AgentIteration)
+                .where(AgentIteration.agent_run_id == agent_run.id)
+                .where(AgentIteration.linked_run_id.is_not(None))
+                .order_by(desc(AgentIteration.created_at))
+            ).scalars().first()
+            if iteration is None or iteration.linked_run_id is None:
+                return None
+            clarification = pending_clarification_for_run(session, iteration.linked_run_id)
+            if clarification is None:
+                return None
+            router = TelegramMessageRouter(home)
+            text = router.render_goal_view(agent_run.id)
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ 批准", callback_data=f"approve:{clarification.id}"),
+                InlineKeyboardButton("❌ 拒绝", callback_data=f"reject:{clarification.id}"),
+            ]])
+            return text, keyboard
+    except Exception:
+        return None
+
+
 def serve_telegram(home: Path) -> None:
     load_config(home)
     token_env = "TELEGRAM_BOT_TOKEN"
@@ -271,13 +307,22 @@ def serve_telegram(home: Path) -> None:
     async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.effective_chat is None or update.effective_user is None or update.message is None:
             return
+        tg_user_id = str(update.effective_user.id)
+        chat_id_str = str(update.effective_chat.id)
         reply = router.handle_text(
-            chat_id=str(update.effective_chat.id),
-            user_id=str(update.effective_user.id),
+            chat_id=chat_id_str,
+            user_id=tg_user_id,
             text=update.message.text or "",
         )
         for chunk in _split_telegram_message(reply):
             await update.message.reply_text(chunk)
+
+        # After normal reply, show pending approval if any (with buttons)
+        external_user_id = f"tg:{update.effective_chat.id}:{update.effective_user.id}"
+        pending = _pending_goal_keyboard(home, external_user_id)
+        if pending:
+            goal_text, keyboard = pending
+            await update.message.reply_text(goal_text, reply_markup=keyboard)
 
     app = Application.builder().token(token).build()
     app.add_handler(MessageHandler(filters.TEXT, handle_message))
