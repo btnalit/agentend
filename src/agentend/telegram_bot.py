@@ -4,16 +4,18 @@ import json
 import os
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import desc, select
 
 from agentend.config import load_config
+from agentend.core.clarifications import answer_clarification, pending_clarification_for_run
 from agentend.core.conversation import ConversationService
 from agentend.core.events import record_event
 from agentend.core.profile import load_agent_profile
 from agentend.core.secrets import redact_text
+from agentend.core.tasks import TaskManager
 from agentend.core.workflow_registry import WorkflowRegistry
 from agentend.core.workflow_runner import WorkflowRunFailed, WorkflowRunner
-from agentend.db.models import ClarificationRequest, Conversation, Run
+from agentend.db.models import AgentIteration, AgentRun, ClarificationRequest, Conversation, Run
 from agentend.db.session import init_database
 from agentend.db.session import session_scope
 
@@ -159,6 +161,70 @@ class TelegramMessageRouter:
         return redacted
 
 
+    def render_goal_view(self, agent_run_id: str) -> str:
+        with session_scope(self.home) as session:
+            run = session.get(AgentRun, agent_run_id)
+            if run is None:
+                return f"目标 {agent_run_id[:8]} 不存在。"
+
+            lines = [
+                f"🎯 目标：{run.goal}",
+                f"状态：{run.status}",
+                f"ID：{run_id_short(agent_run_id)}",
+            ]
+
+            if run.status == "waiting_input":
+                # 通过 linked_run_id 中转查询 pending clarification（D8）
+                iteration = session.execute(
+                    select(AgentIteration)
+                    .where(AgentIteration.agent_run_id == agent_run_id)
+                    .where(AgentIteration.linked_run_id.is_not(None))
+                    .order_by(desc(AgentIteration.created_at))
+                ).scalars().first()
+
+                if iteration and iteration.linked_run_id:
+                    clarification = pending_clarification_for_run(session, iteration.linked_run_id)
+                    if clarification:
+                        lines.append(f"\n⏸ 等待审批：{clarification.question}")
+                        lines.append(f"approve:{clarification.id}")
+                        lines.append(f"reject:{clarification.id}")
+
+            return "\n".join(lines)
+
+    def approve_clarification(self, request_id: str, agent_run_id: str) -> str:
+        with session_scope(self.home) as session:
+            clarification = session.get(ClarificationRequest, request_id)
+            if clarification is None or clarification.status != "pending":
+                return "审批请求已过期或已处理。"
+            try:
+                answer_clarification(session, clarification, "approve")
+            except ValueError as exc:
+                return f"审批失败：{exc}"
+        TaskManager(self.home).enqueue_resume_intent(agent_run_id, run_mode="normal", answer_text="approve")
+        return f"✅ 已批准，目标 {agent_run_id[:8]} 继续运行。"
+
+    def reject_clarification(self, request_id: str, agent_run_id: str) -> str:
+        with session_scope(self.home) as session:
+            clarification = session.get(ClarificationRequest, request_id)
+            if clarification is None or clarification.status != "pending":
+                return "审批请求已过期或已处理。"
+            try:
+                answer_clarification(session, clarification, "reject")
+            except ValueError as exc:
+                return f"拒绝失败：{exc}"
+            agent_run = session.get(AgentRun, agent_run_id)
+            if agent_run:
+                agent_run.status = "cancelled"
+                agent_run.stop_reason = "user_rejected"
+                from agentend.db.models import utc_now
+                agent_run.completed_at = utc_now()
+        return f"❌ 已拒绝，目标 {agent_run_id[:8]} 已取消。"
+
+
+def run_id_short(run_id: str) -> str:
+    return run_id[:8] + "…"
+
+
 def _telegram_external_user_id(chat_id: str, user_id: str) -> str:
     return f"{chat_id}:{user_id}"
 
@@ -215,6 +281,44 @@ def serve_telegram(home: Path) -> None:
 
     app = Application.builder().token(token).build()
     app.add_handler(MessageHandler(filters.TEXT, handle_message))
+
+    from telegram.ext import CallbackQueryHandler as TgCallbackQueryHandler
+
+    router_ref = router  # 闭包引用
+
+    async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if query is None or query.data is None:
+            return
+        await query.answer()
+        parts = query.data.split(":", 1)
+        if len(parts) != 2 or parts[0] not in ("approve", "reject"):
+            return
+        action, request_id = parts
+
+        # 通过 request_id 找 run_id，再找 agent_run_id
+        with session_scope(home) as session:
+            clarification = session.get(ClarificationRequest, request_id)
+            if clarification is None:
+                await query.edit_message_text("审批请求不存在。")
+                return
+            iteration = session.execute(
+                select(AgentIteration)
+                .where(AgentIteration.linked_run_id == clarification.run_id)
+                .order_by(desc(AgentIteration.created_at))
+            ).scalars().first()
+            if iteration is None:
+                await query.edit_message_text("找不到关联目标。")
+                return
+            agent_run_id = iteration.agent_run_id
+
+        if action == "approve":
+            reply = router_ref.approve_clarification(request_id, agent_run_id)
+        else:
+            reply = router_ref.reject_clarification(request_id, agent_run_id)
+        await query.edit_message_text(reply)
+
+    app.add_handler(TgCallbackQueryHandler(handle_approval_callback))
     app.run_polling()
 
 
