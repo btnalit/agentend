@@ -267,6 +267,34 @@ class TaskManager:
             outcomes.append(outcome)
         return outcomes
 
+    def enqueue_resume_intent(
+        self,
+        agent_run_id: str,
+        *,
+        run_mode: str = "normal",
+        answer_text: str = "",
+    ) -> "TaskItem | None":
+        with session_scope(self.home) as session:
+            existing = session.execute(
+                select(TaskItem)
+                .where(TaskItem.agent_run_id == agent_run_id)
+                .where(TaskItem.status == "pending")
+            ).scalars().first()
+            if existing:
+                return None
+            task = TaskItem(
+                id=str(uuid4()),
+                title=f"Resume {agent_run_id[:8]}",
+                workflow_id="agent.resume",
+                input_text=answer_text,
+                status="pending",
+                source="approval",
+                agent_run_id=agent_run_id,
+                run_mode=run_mode,
+            )
+            session.add(task)
+            return task
+
     def scan_inbox_once(
         self,
         *,
