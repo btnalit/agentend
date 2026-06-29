@@ -80,5 +80,7 @@ def test_render_goal_view_shows_approve_reject_when_waiting(tmp_path) -> None:
     view = router.render_goal_view(agent_run_id)
 
     assert "写报告" in view
-    assert "approve:" + req_id in view
-    assert "reject:" + req_id in view
+    # approve/reject text lines removed — buttons are now InlineKeyboardMarkup (Finding 2A fix)
+    assert "approve:" + req_id not in view
+    assert "reject:" + req_id not in view
+    assert "👆 请使用下方按钮审批" in view
