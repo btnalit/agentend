@@ -374,25 +374,22 @@ def serve_telegram(home: Path) -> None:
                     early_exit_msg = "找不到关联目标。"
                 else:
                     agent_run_id = iteration.agent_run_id
+                    # Bug 1 fix: verify caller owns the run (in same session, no second session_scope needed)
+                    if query.from_user is None:
+                        early_exit_msg = "无法验证身份。"
+                    else:
+                        effective_chat_id = (
+                            str(update.effective_chat.id) if update.effective_chat is not None
+                            else (str(query.message.chat.id) if query.message is not None else "")
+                        )
+                        caller_external_id = _telegram_external_user_id(effective_chat_id, str(query.from_user.id))
+                        ar = session.get(AgentRun, agent_run_id)
+                        if ar is None or ar.external_user_id != caller_external_id:
+                            early_exit_msg = "您无权操作此审批。"
 
         if early_exit_msg is not None:
             await query.edit_message_text(early_exit_msg)
             return
-
-        # Bug 1 fix: verify caller owns the run
-        if query.from_user is None:
-            await query.edit_message_text("无法验证身份。")
-            return
-        effective_chat_id = (
-            str(update.effective_chat.id) if update.effective_chat is not None
-            else (str(query.message.chat.id) if query.message is not None else "")
-        )
-        caller_external_id = _telegram_external_user_id(effective_chat_id, str(query.from_user.id))
-        with session_scope(home) as session:
-            ar = session.get(AgentRun, agent_run_id)
-            if ar is None or ar.external_user_id != caller_external_id:
-                await query.edit_message_text("您无权操作此审批。")
-                return
 
         if action == "approve":
             reply = router_ref.approve_clarification(request_id, agent_run_id)
