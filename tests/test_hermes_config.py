@@ -19,9 +19,9 @@ def test_hermes_home_loaded_from_config(tmp_path: Path) -> None:
     config_path = home / "config.toml"
     # Convert path to forward slashes for TOML compatibility
     hermes_path_toml = (tmp_path / "hermes").as_posix()
-    config_path.write_text(
-        config_path.read_text(encoding="utf-8") + f'\n[hermes]\nhome = "{hermes_path_toml}"\n',
-        encoding="utf-8",
-    )
+    # Replace the existing home = "" line in [hermes] section instead of appending
+    original = config_path.read_text(encoding="utf-8")
+    updated = original.replace('[hermes]\nhome = ""', f'[hermes]\nhome = "{hermes_path_toml}"')
+    config_path.write_text(updated, encoding="utf-8")
     config = load_config(home)
     assert config.hermes_home == hermes_path_toml
