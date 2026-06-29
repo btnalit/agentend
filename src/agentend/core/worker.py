@@ -39,7 +39,7 @@ class AgentWorker:
             created = created_from_schedules + created_from_inbox
             return WorkerResult(0, created, created_from_schedules, [], "no work")
 
-        if task.agent_run_id:
+        if task.agent_run_id is not None:
             with session_scope(self.home) as session:
                 agent_run = session.get(AgentRun, task.agent_run_id)
             if agent_run and agent_run.status == "waiting_input":
@@ -54,7 +54,7 @@ class AgentWorker:
                     processed_tasks=1,
                     created_tasks=created_from_schedules + created_from_inbox,
                     schedule_count=created_from_schedules,
-                    agent_run_ids=[task.agent_run_id or ""],
+                    agent_run_ids=[task.agent_run_id],
                     message="skipped_resume",
                 )
         else:
